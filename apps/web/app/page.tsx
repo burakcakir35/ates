@@ -46,7 +46,18 @@ function RevealTxid({ txid }: { txid: string }) {
 }
 
 export default function GamePage() {
-  const [currency, setCurrency] = useState('USD');
+  const [currency] = useState(() =>
+    typeof window === 'undefined'
+      ? 'USD'
+      : localStorage.getItem('ates:currency') ?? 'USD',
+  );
+
+  // Switching fiat creates a fresh player profile in that currency.
+  function changeCurrency(next: string) {
+    localStorage.setItem('ates:currency', next);
+    localStorage.removeItem('ates:playerId');
+    window.location.reload();
+  }
   const { connected, player, limits, state, lastResult, myResult, placeBet, autoPick } =
     useGame('Guest', currency);
   const [coinNames, setCoinNames] = useState<Record<string, string>>({});
@@ -204,8 +215,8 @@ export default function GamePage() {
             <span className="muted">Para birimi</span>
             <select
               value={currency}
-              onChange={(e) => setCurrency(e.target.value)}
-              title="Yeni oyuncu için para birimi (sayfayı yenileyince geçerli)"
+              onChange={(e) => changeCurrency(e.target.value)}
+              title="Para birimini değiştirmek o para biriminde yeni bir oyuncu profili açar"
             >
               <option>USD</option>
               <option>EUR</option>
