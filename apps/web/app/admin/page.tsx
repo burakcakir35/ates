@@ -72,15 +72,15 @@ export default function AdminPage() {
             <b>{stats?.roundsPlayed ?? 0}</b>
           </div>
           <div className="history-row">
-            <span>Son turlar — toplam bahis</span>
+            <span>Son turlar — toplam bahis (USD)</span>
             <b>{(stats?.recentTotalStaked ?? 0).toFixed(2)}</b>
           </div>
           <div className="history-row">
-            <span>Son turlar — toplam ödeme</span>
+            <span>Son turlar — toplam ödeme (USD)</span>
             <b>{(stats?.recentTotalPaidOut ?? 0).toFixed(2)}</b>
           </div>
           <div className="history-row">
-            <span>Ev kâr/zarar (P&L)</span>
+            <span>Ev kâr/zarar (P&L, USD)</span>
             <b
               style={{
                 color:

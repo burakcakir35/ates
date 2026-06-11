@@ -3,22 +3,29 @@ import { Injectable, Logger } from '@nestjs/common';
 import { v4 as uuid } from 'uuid';
 import {
   BetResult,
+  BetSelection,
+  BetTypeId,
   CHAIN_IDS,
+  ChainId,
   DEFAULT_JACKPOT_CONFIG,
   JackpotPools,
+  autoPick,
   captureBeacon,
   commit,
   computeResultHash,
   contribute,
   deriveWinningTxid,
   generateServerSeed,
+  getChain,
   hasIdenticalTail,
   initJackpot,
-  maxExposure,
   payoutMultiplier,
+  selectCoinPool,
+  selectWinningCoin,
   settleRound,
 } from '@ates/engine';
 import { Currency, GAME_CONFIG, RoundPhase } from '../config';
+import { CoinTicker, convert, getRate, isCoin } from '../fx';
 import {
   ActiveBet,
   JackpotAward,
@@ -27,6 +34,7 @@ import {
   PublicRoundState,
   Round,
   SettledRound,
+  WalletTx,
 } from './game.types';
 
 export interface ResultEvent {
@@ -79,6 +87,7 @@ export class GameService {
       currency,
       balance: GAME_CONFIG.startingBalance,
       streak: 0,
+      transactions: [],
     };
     this.players.set(player.id, player);
     return player;
@@ -90,6 +99,15 @@ export class GameService {
 
   // ---- betting ----------------------------------------------------------
 
+  /** Min/max bet thresholds in the player's fiat (limits are USD in config). */
+  betLimitsFor(currency: Currency): { min: number; max: number } {
+    const rate = getRate('USD', currency);
+    return {
+      min: Math.round(GAME_CONFIG.minBet * rate * 100) / 100,
+      max: Math.round(GAME_CONFIG.maxBet * rate * 100) / 100,
+    };
+  }
+
   placeBet(input: PlaceBetInput): ActiveBet {
     const player = this.players.get(input.playerId);
     if (!player) {
@@ -98,31 +116,39 @@ export class GameService {
     if (this.round.phase !== 'betting') {
       throw new Error('Betting is closed for this round');
     }
-    if (input.amount < GAME_CONFIG.minBet) {
-      throw new Error(`Minimum bet is ${GAME_CONFIG.minBet}`);
+    if (!Number.isFinite(input.amount)) {
+      throw new Error('Invalid amount');
     }
-    if (input.amount > GAME_CONFIG.maxBet) {
-      throw new Error(`Maximum bet is ${GAME_CONFIG.maxBet}`);
+    const limits = this.betLimitsFor(player.currency);
+    if (input.amount < limits.min) {
+      throw new Error(
+        `Minimum bet is ${limits.min} ${player.currency} (${GAME_CONFIG.minBet} USD)`,
+      );
+    }
+    if (input.amount > limits.max) {
+      throw new Error(
+        `Maximum bet is ${limits.max} ${player.currency} (${GAME_CONFIG.maxBet} USD)`,
+      );
     }
     if (input.amount > player.balance) {
       throw new Error('Insufficient balance');
     }
 
+    const amount = Math.round(input.amount * 100) / 100;
     const bet: ActiveBet = {
       id: uuid(),
       playerId: player.id,
       betType: input.type,
       type: input.type,
       selection: input.selection,
-      amount: Math.round(input.amount * 100) / 100,
+      amount,
+      amountUsd: Math.round(convert(amount, player.currency, 'USD') * 100) / 100,
     };
+    // Validates the bet type/selection up front (throws on unknown type).
+    this.maxPoolMultiplier(bet.type, bet.selection);
 
-    // Risk control: refuse bets that would push round exposure over the cap.
-    const projected = maxExposure(
-      [...this.round.bets, bet],
-      this.round.winningChain,
-      GAME_CONFIG.houseEdge,
-    );
+    // Risk control: worst-case exposure across the whole coin pool, in USD.
+    const projected = this.projectedExposureUsd([...this.round.bets, bet]);
     if (projected > GAME_CONFIG.maxRoundExposure) {
       throw new Error('Round exposure cap reached, try a smaller bet');
     }
@@ -134,20 +160,138 @@ export class GameService {
     return bet;
   }
 
+  /** Auto-pick: place `count` random bets through the normal bet flow. */
+  autoPlaceBets(
+    playerId: string,
+    count: number,
+    amount: number,
+  ): { placed: { betId: string; type: BetTypeId; selection: BetSelection }[] } {
+    const picks = autoPick(count);
+    const placed: { betId: string; type: BetTypeId; selection: BetSelection }[] =
+      [];
+    for (const pick of picks) {
+      const bet = this.placeBet({
+        playerId,
+        type: pick.type,
+        selection: pick.selection,
+        amount,
+      });
+      placed.push({ betId: bet.id, type: pick.type, selection: pick.selection });
+    }
+    return { placed };
+  }
+
+  // ---- wallet: mock crypto deposits/withdrawals via FX ------------------
+
+  deposit(playerId: string, coin: string, coinAmount: number): WalletTx {
+    const player = this.players.get(playerId);
+    if (!player) {
+      throw new Error('Unknown player');
+    }
+    if (!isCoin(coin)) {
+      throw new Error(`Unsupported coin: ${coin}`);
+    }
+    if (!Number.isFinite(coinAmount) || coinAmount <= 0) {
+      throw new Error('Amount must be > 0');
+    }
+    const rate = getRate(coin as CoinTicker, player.currency);
+    const fiatAmount = Math.round(coinAmount * rate * 100) / 100;
+    const tx: WalletTx = {
+      id: uuid(),
+      type: 'deposit',
+      coin,
+      coinAmount,
+      rate,
+      fiatAmount,
+      currency: player.currency,
+      at: Date.now(),
+    };
+    player.balance = Math.round((player.balance + fiatAmount) * 100) / 100;
+    player.transactions.unshift(tx);
+    this.emitWallet(player);
+    return tx;
+  }
+
+  withdraw(playerId: string, coin: string, fiatAmount: number): WalletTx {
+    const player = this.players.get(playerId);
+    if (!player) {
+      throw new Error('Unknown player');
+    }
+    if (!isCoin(coin)) {
+      throw new Error(`Unsupported coin: ${coin}`);
+    }
+    if (!Number.isFinite(fiatAmount) || fiatAmount <= 0) {
+      throw new Error('Amount must be > 0');
+    }
+    if (fiatAmount > player.balance) {
+      throw new Error('Insufficient balance');
+    }
+    const rate = getRate(coin as CoinTicker, player.currency);
+    const coinAmount = fiatAmount / rate;
+    const tx: WalletTx = {
+      id: uuid(),
+      type: 'withdraw',
+      coin,
+      coinAmount,
+      rate,
+      fiatAmount: Math.round(fiatAmount * 100) / 100,
+      currency: player.currency,
+      at: Date.now(),
+    };
+    player.balance = Math.round((player.balance - tx.fiatAmount) * 100) / 100;
+    player.transactions.unshift(tx);
+    this.emitWallet(player);
+    return tx;
+  }
+
+  getTransactions(playerId: string): WalletTx[] {
+    return this.players.get(playerId)?.transactions ?? [];
+  }
+
+  /** Highest payout multiplier a bet could hit across this round's pool. */
+  private maxPoolMultiplier(type: BetTypeId, selection: BetSelection): number {
+    let max = 0;
+    for (const coin of this.round.coinPool) {
+      try {
+        max = Math.max(
+          max,
+          payoutMultiplier(type, coin, selection, GAME_CONFIG.houseEdge),
+        );
+      } catch {
+        // Selection not applicable to this coin's alphabet — skip it.
+      }
+    }
+    if (max === 0) {
+      throw new Error(`Unknown bet type: ${type}`);
+    }
+    return max;
+  }
+
+  private projectedExposureUsd(bets: ActiveBet[]): number {
+    let total = 0;
+    for (const bet of bets) {
+      total += bet.amountUsd * this.maxPoolMultiplier(bet.type, bet.selection);
+    }
+    return Math.round(total * 100) / 100;
+  }
+
   // ---- round lifecycle --------------------------------------------------
 
   private beginBetting(): void {
     this.roundCounter += 1;
     const serverSeed = generateServerSeed();
-    const winningChain =
-      CHAIN_IDS[Math.floor(Math.random() * CHAIN_IDS.length)];
+    const id = uuid();
+    const commitHash = commit(serverSeed);
+    // The 20-coin pool is fixed at commit time and publicly re-derivable
+    // from commitHash + roundId; the winner is drawn from it after the lock.
+    const coinPool = selectCoinPool(commitHash, id);
     this.round = {
-      id: uuid(),
+      id,
       index: this.roundCounter,
       phase: 'betting',
-      winningChain,
+      coinPool,
       serverSeed,
-      commitHash: commit(serverSeed),
+      commitHash,
       bets: [],
       phaseEndsAt: Date.now() + GAME_CONFIG.bettingMs,
     };
@@ -164,6 +308,10 @@ export class GameService {
       this.round.beacon,
       this.round.id,
     );
+    this.round.winningChain = selectWinningCoin(
+      this.round.resultHash,
+      this.round.coinPool,
+    );
     this.round.winningTxid = deriveWinningTxid(
       this.round.resultHash,
       this.round.winningChain,
@@ -174,9 +322,10 @@ export class GameService {
   private revealRound(): void {
     const round = this.round;
     const txid = round.winningTxid as string;
+    const winningChain = round.winningChain as ChainId;
     const settlement = settleRound(
       round.bets,
-      round.winningChain,
+      winningChain,
       txid,
       GAME_CONFIG.houseEdge,
     );
@@ -187,7 +336,8 @@ export class GameService {
     const stakeByPlayer = new Map<string, number>();
 
     for (const bet of round.bets) {
-      contribute(this.jackpot, bet.amount, DEFAULT_JACKPOT_CONFIG);
+      // Progressive pools are denominated in USD.
+      contribute(this.jackpot, bet.amountUsd, DEFAULT_JACKPOT_CONFIG);
       stakeByPlayer.set(
         bet.playerId,
         (stakeByPlayer.get(bet.playerId) ?? 0) + bet.amount,
@@ -209,22 +359,34 @@ export class GameService {
     const awards = this.processJackpots(
       wonByPlayer,
       stakeByPlayer,
-      round.winningChain,
+      winningChain,
       txid,
     );
+
+    // Round totals are normalized to USD (players may bet in any fiat).
+    const totalStakedUsd = round.bets.reduce((s, b) => s + b.amountUsd, 0);
+    let totalPaidUsd = 0;
+    for (const result of settlement.results) {
+      if (result.won) {
+        const player = this.players.get(result.playerId);
+        const cur = player?.currency ?? 'USD';
+        totalPaidUsd += convert(result.payout, cur, 'USD');
+      }
+    }
 
     const settled: SettledRound = {
       roundId: round.id,
       index: round.index,
-      winningChain: round.winningChain,
+      coinPool: round.coinPool,
+      winningChain,
       winningTxid: txid,
       serverSeed: round.serverSeed,
       commitHash: round.commitHash,
       resultHash: round.resultHash as string,
       beacon: round.beacon!,
-      totalStaked: settlement.totalStaked,
-      totalPaidOut: settlement.totalPaidOut,
-      housePnl: settlement.housePnl,
+      totalStaked: Math.round(totalStakedUsd * 100) / 100,
+      totalPaidOut: Math.round(totalPaidUsd * 100) / 100,
+      housePnl: Math.round((totalStakedUsd - totalPaidUsd) * 100) / 100,
       awards,
       settledAt: Date.now(),
     };
@@ -253,7 +415,7 @@ export class GameService {
   private processJackpots(
     wonByPlayer: Set<string>,
     stakeByPlayer: Map<string, number>,
-    winningChain: Round['winningChain'],
+    winningChain: ChainId,
     txid: string,
   ): JackpotAward[] {
     const cfg = DEFAULT_JACKPOT_CONFIG;
@@ -276,10 +438,23 @@ export class GameService {
       } else if (player.streak === 5) {
         awards.push(this.payAward(player, 'MINOR', stake * cfg.minorMultiplier));
       } else if (player.streak === cfg.grandStreak - 1) {
-        awards.push(this.payAward(player, 'MAJOR', this.jackpot.major));
+        // Progressive pools are USD; award in the player's fiat.
+        awards.push(
+          this.payAward(
+            player,
+            'MAJOR',
+            convert(this.jackpot.major, 'USD', player.currency),
+          ),
+        );
         this.jackpot.major = cfg.majorSeed;
       } else if (player.streak >= cfg.grandStreak) {
-        awards.push(this.payAward(player, 'GRAND', this.jackpot.grand));
+        awards.push(
+          this.payAward(
+            player,
+            'GRAND',
+            convert(this.jackpot.grand, 'USD', player.currency),
+          ),
+        );
         this.jackpot.grand = cfg.grandSeed;
         player.streak = 0;
       }
@@ -289,11 +464,17 @@ export class GameService {
     if (hasIdenticalTail(winningChain, txid, cfg.grandTailLength)) {
       const winners = [...wonByPlayer];
       if (winners.length > 0) {
-        const share = this.jackpot.grand / winners.length;
+        const shareUsd = this.jackpot.grand / winners.length;
         for (const playerId of winners) {
           const player = this.players.get(playerId);
           if (player) {
-            awards.push(this.payAward(player, 'GRAND_TAIL', share));
+            awards.push(
+              this.payAward(
+                player,
+                'GRAND_TAIL',
+                convert(shareUsd, 'USD', player.currency),
+              ),
+            );
           }
         }
         this.jackpot.grand = cfg.grandSeed;
@@ -339,20 +520,53 @@ export class GameService {
   }
 
   getPublicState(): PublicRoundState {
-    const totalStaked = this.round.bets.reduce((s, b) => s + b.amount, 0);
+    const totalStakedUsd = this.round.bets.reduce((s, b) => s + b.amountUsd, 0);
+    const ranges: PublicRoundState['multiplierRanges'] = {};
+    const samples: Record<string, BetSelection> = {
+      LAST_CHAR_DIGIT: {},
+      LAST_CHAR_LETTER: {},
+      LAST_CHAR_PARITY: { parity: 'even' },
+      FIRST_CHAR_RANGE: { range: 'high' },
+      SUM_PARITY: { parity: 'even' },
+    };
+    for (const [type, selection] of Object.entries(samples)) {
+      let min = Infinity;
+      let max = 0;
+      for (const coin of this.round.coinPool) {
+        try {
+          const m = payoutMultiplier(
+            type as BetTypeId,
+            coin,
+            selection,
+            GAME_CONFIG.houseEdge,
+          );
+          min = Math.min(min, m);
+          max = Math.max(max, m);
+        } catch {
+          // not applicable for this coin
+        }
+      }
+      ranges[type] = { min: min === Infinity ? 0 : min, max };
+    }
     return {
       roundId: this.round.id,
       index: this.round.index,
       phase: this.round.phase,
-      winningChain: this.round.winningChain,
+      coinPool: this.round.coinPool.map((id) => ({
+        id,
+        name: getChain(id).name,
+      })),
+      winningChain:
+        this.round.phase === 'betting' ? null : this.round.winningChain ?? null,
       commitHash: this.round.commitHash,
       phaseEndsAt: this.round.phaseEndsAt,
-      totalStaked: Math.round(totalStaked * 100) / 100,
+      totalStaked: Math.round(totalStakedUsd * 100) / 100,
       betCount: this.round.bets.length,
       jackpot: {
         major: Math.round(this.jackpot.major * 100) / 100,
         grand: Math.round(this.jackpot.grand * 100) / 100,
       },
+      multiplierRanges: ranges,
     };
   }
 

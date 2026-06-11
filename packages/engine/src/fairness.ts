@@ -1,9 +1,10 @@
 import { createHash, randomBytes } from 'crypto';
-import { ChainId, CHAIN_IDS } from './chains';
+import { BeaconChainId, ChainId, CHAIN_IDS } from './chains';
+import { selectCoinPool, selectWinningCoin } from './pool';
 import { generateTxid } from './txid';
 
 /** Per-chain beacon hash captured at lock time (simulated in the prototype). */
-export type BeaconHashes = Record<ChainId, string>;
+export type BeaconHashes = Record<BeaconChainId, string>;
 
 export interface CommitRevealRound {
   roundId: string;
@@ -18,6 +19,11 @@ export interface CommitRevealRound {
   /** The winning TXID derived from resultHash, per the round's chain. */
   winningChain: ChainId;
   winningTxid: string;
+  /**
+   * The round's 20-coin pool, derived from commitHash + roundId. When present,
+   * verification also re-derives the pool and the winning-coin selection.
+   */
+  coinPool?: ChainId[];
 }
 
 export function sha256Hex(input: string): string {
@@ -86,6 +92,22 @@ export function verifyRound(round: CommitRevealRound): boolean {
   );
   if (resultHash !== round.resultHash) {
     return false;
+  }
+  if (round.coinPool) {
+    const expectedPool = selectCoinPool(
+      round.commitHash,
+      round.roundId,
+      round.coinPool.length,
+    );
+    if (
+      expectedPool.length !== round.coinPool.length ||
+      expectedPool.some((c, i) => c !== round.coinPool![i])
+    ) {
+      return false;
+    }
+    if (selectWinningCoin(resultHash, expectedPool) !== round.winningChain) {
+      return false;
+    }
   }
   const txid = deriveWinningTxid(resultHash, round.winningChain);
   return txid === round.winningTxid;

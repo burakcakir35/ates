@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 import {
+  BetLimits,
   BetResult,
   PlayerInfo,
   PublicRoundState,
@@ -29,10 +30,17 @@ export interface PlaceBetResponse {
   error?: string;
 }
 
+export interface AutoPickResponse {
+  ok: boolean;
+  placed?: { betId: string; type: string; selection: Record<string, unknown> }[];
+  error?: string;
+}
+
 export function useGame(name: string, currency: string) {
   const socketRef = useRef<Socket | null>(null);
   const [connected, setConnected] = useState(false);
   const [player, setPlayer] = useState<PlayerInfo | null>(null);
+  const [limits, setLimits] = useState<BetLimits | null>(null);
   const [state, setState] = useState<PublicRoundState | null>(null);
   const [lastResult, setLastResult] = useState<SettledRound | null>(null);
   const [myResult, setMyResult] = useState<MyResult | null>(null);
@@ -47,10 +55,16 @@ export function useGame(name: string, currency: string) {
       socket.emit(
         'player:hello',
         { playerId: storedId, name, currency },
-        (resp: { ok: boolean; player: PlayerInfo; state: PublicRoundState }) => {
+        (resp: {
+          ok: boolean;
+          player: PlayerInfo;
+          limits: BetLimits;
+          state: PublicRoundState;
+        }) => {
           if (resp?.ok) {
             localStorage.setItem('ates:playerId', resp.player.id);
             setPlayer(resp.player);
+            setLimits(resp.limits ?? null);
             setState(resp.state);
           }
         },
@@ -89,5 +103,31 @@ export function useGame(name: string, currency: string) {
     [player],
   );
 
-  return { connected, player, state, lastResult, myResult, placeBet };
+  const autoPick = useCallback(
+    (count: number, amount: number) =>
+      new Promise<AutoPickResponse>((resolve) => {
+        const socket = socketRef.current;
+        if (!socket || !player) {
+          resolve({ ok: false, error: 'Not connected' });
+          return;
+        }
+        socket.emit(
+          'bet:autopick',
+          { playerId: player.id, count, amount },
+          (resp: AutoPickResponse) => resolve(resp),
+        );
+      }),
+    [player],
+  );
+
+  return {
+    connected,
+    player,
+    limits,
+    state,
+    lastResult,
+    myResult,
+    placeBet,
+    autoPick,
+  };
 }

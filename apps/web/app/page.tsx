@@ -4,10 +4,10 @@ import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useGame } from '../lib/useGame';
 import {
-  BetCatalogueItem,
-  ChainId,
+  CURRENCY_SYMBOL,
   SERVER_URL,
   SettledRound,
+  WalletTx,
 } from '../lib/types';
 
 interface BetOption {
@@ -28,13 +28,6 @@ const BET_OPTIONS: BetOption[] = [
   { id: 'sumOdd', label: 'Toplam TEK', type: 'SUM_PARITY', selection: { parity: 'odd' } },
 ];
 
-const CHAIN_LABEL: Record<ChainId, string> = {
-  BTC: 'Bitcoin',
-  ETH: 'Ethereum',
-  TRX: 'Tron',
-  SOL: 'Solana',
-};
-
 function RevealTxid({ txid }: { txid: string }) {
   // Highlight the last character (most bets resolve on it).
   return (
@@ -54,16 +47,19 @@ function RevealTxid({ txid }: { txid: string }) {
 
 export default function GamePage() {
   const [currency, setCurrency] = useState('USD');
-  const { connected, player, state, lastResult, myResult, placeBet } = useGame(
-    'Guest',
-    currency,
-  );
-  const [catalogue, setCatalogue] = useState<BetCatalogueItem[]>([]);
+  const { connected, player, limits, state, lastResult, myResult, placeBet, autoPick } =
+    useGame('Guest', currency);
+  const [coinNames, setCoinNames] = useState<Record<string, string>>({});
   const [selected, setSelected] = useState<BetOption>(BET_OPTIONS[0]);
   const [amount, setAmount] = useState(5);
+  const [autoCount, setAutoCount] = useState(3);
   const [now, setNow] = useState(Date.now());
   const [toast, setToast] = useState<{ kind: string; msg: string } | null>(null);
   const [history, setHistory] = useState<SettledRound[]>([]);
+  const [walletCoin, setWalletCoin] = useState('USDT');
+  const [walletAmount, setWalletAmount] = useState(100);
+  const [depositCoins, setDepositCoins] = useState<string[]>([]);
+  const [lastTx, setLastTx] = useState<WalletTx | null>(null);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 200);
@@ -71,9 +67,15 @@ export default function GamePage() {
   }, []);
 
   useEffect(() => {
-    fetch(`${SERVER_URL}/api/bet-types`)
+    fetch(`${SERVER_URL}/api/coins`)
       .then((r) => r.json())
-      .then(setCatalogue)
+      .then((coins: { id: string; name: string }[]) =>
+        setCoinNames(Object.fromEntries(coins.map((c) => [c.id, c.name]))),
+      )
+      .catch(() => undefined);
+    fetch(`${SERVER_URL}/api/fx/rates`)
+      .then((r) => r.json())
+      .then((d: { depositCoins: string[] }) => setDepositCoins(d.depositCoins))
       .catch(() => undefined);
   }, []);
 
@@ -94,19 +96,21 @@ export default function GamePage() {
     const total = myResult.results.reduce((s, r) => s + r.payout, 0);
     setToast(
       won
-        ? { kind: 'win', msg: `Kazandın! +${total.toFixed(2)} ${currency}` }
+        ? { kind: 'win', msg: `Kazandın! +${total.toFixed(2)} ${player?.currency ?? currency}` }
         : { kind: 'lose', msg: 'Bu tur kaybettin.' },
     );
-  }, [myResult, lastResult, state, currency]);
+  }, [myResult, lastResult, state, currency, player]);
 
   const remainingMs = state ? Math.max(0, state.phaseEndsAt - now) : 0;
   const remainingSec = Math.ceil(remainingMs / 1000);
 
-  const multiplier = useMemo(() => {
-    if (!state) return 0;
-    const item = catalogue.find((c) => c.type === selected.type);
-    return item ? item.multipliers[state.winningChain] : 0;
-  }, [catalogue, selected, state]);
+  const symbol = CURRENCY_SYMBOL[player?.currency ?? currency] ?? '';
+  const coinLabel = (id: string) => coinNames[id] ?? id;
+
+  const range = useMemo(() => {
+    if (!state) return null;
+    return state.multiplierRanges?.[selected.type] ?? null;
+  }, [state, selected]);
 
   const canBet = state?.phase === 'betting' && connected && !!player;
 
@@ -117,6 +121,50 @@ export default function GamePage() {
       setToast({ kind: 'err', msg: resp.error ?? 'Bahis başarısız' });
     } else {
       setToast({ kind: 'win', msg: `Bahis alındı: ${selected.label}` });
+    }
+  }
+
+  async function onAutoPick() {
+    setToast(null);
+    const resp = await autoPick(autoCount, amount);
+    if (!resp.ok) {
+      setToast({ kind: 'err', msg: resp.error ?? 'Oto doldur başarısız' });
+    } else {
+      setToast({
+        kind: 'win',
+        msg: `Oto doldur: ${resp.placed?.length ?? 0} bahis alındı (her biri ${amount} ${player?.currency})`,
+      });
+    }
+  }
+
+  async function wallet(kind: 'deposit' | 'withdraw') {
+    setToast(null);
+    if (!player) return;
+    try {
+      const r = await fetch(
+        `${SERVER_URL}/api/wallet/${player.id}/${kind}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ coin: walletCoin, amount: walletAmount }),
+        },
+      );
+      const data = await r.json();
+      if (!r.ok || !data.ok) {
+        setToast({ kind: 'err', msg: data.message ?? 'İşlem başarısız' });
+        return;
+      }
+      setLastTx(data.tx as WalletTx);
+      const tx = data.tx as WalletTx;
+      setToast({
+        kind: 'win',
+        msg:
+          kind === 'deposit'
+            ? `Yatırım: ${tx.coinAmount} ${tx.coin} → ${tx.fiatAmount.toFixed(2)} ${tx.currency} (kur ${tx.rate.toFixed(4)})`
+            : `Çekim: ${tx.fiatAmount.toFixed(2)} ${tx.currency} → ${tx.coinAmount.toFixed(8)} ${tx.coin} (kur ${tx.rate.toFixed(4)})`,
+      });
+    } catch {
+      setToast({ kind: 'err', msg: 'Sunucuya ulaşılamadı' });
     }
   }
 
@@ -140,11 +188,18 @@ export default function GamePage() {
           <div>
             <div className="muted">Bakiye ({player?.currency ?? currency})</div>
             <div className="balance">
+              {symbol}
               {(player?.balance ?? 0).toFixed(2)}
             </div>
           </div>
           <span className="pill">Streak: {player?.streak ?? 0}</span>
           <span className="pill">Oyuncu: {player?.name ?? 'Guest'}</span>
+          {limits && (
+            <span className="pill" title="Min bahis 0.50 USD'nin para birimindeki karşılığıdır">
+              Min bahis: {symbol}
+              {limits.min.toFixed(2)}
+            </span>
+          )}
           <div style={{ marginLeft: 'auto' }} className="row">
             <span className="muted">Para birimi</span>
             <select
@@ -159,6 +214,34 @@ export default function GamePage() {
             </select>
           </div>
         </div>
+        <div className="row" style={{ marginTop: 10, flexWrap: 'wrap' }}>
+          <span className="muted">Cüzdan (mock):</span>
+          <select value={walletCoin} onChange={(e) => setWalletCoin(e.target.value)}>
+            {depositCoins.map((c) => (
+              <option key={c}>{c}</option>
+            ))}
+          </select>
+          <input
+            type="number"
+            min={0}
+            value={walletAmount}
+            onChange={(e) => setWalletAmount(Number(e.target.value))}
+            style={{ width: 110 }}
+          />
+          <button className="btn" onClick={() => wallet('deposit')}>
+            Yatır (coin → {player?.currency ?? currency})
+          </button>
+          <button className="btn" onClick={() => wallet('withdraw')}>
+            Çek ({player?.currency ?? currency} → coin)
+          </button>
+        </div>
+        {lastTx && (
+          <div className="muted" style={{ marginTop: 6 }}>
+            Son işlem: {lastTx.type === 'deposit' ? 'yatırım' : 'çekim'} ·{' '}
+            {lastTx.coinAmount.toFixed(8)} {lastTx.coin} ↔ {lastTx.fiatAmount.toFixed(2)}{' '}
+            {lastTx.currency} · kur {lastTx.rate.toFixed(4)}
+          </div>
+        )}
       </div>
 
       <div className="grid">
@@ -170,8 +253,10 @@ export default function GamePage() {
               {state?.phase === 'result' && <span className="result">SONUÇ</span>}
             </span>
             <span className="muted">
-              Tur #{state?.index ?? '-'} · Zincir:{' '}
-              {state ? CHAIN_LABEL[state.winningChain] : '-'}
+              Tur #{state?.index ?? '-'} ·{' '}
+              {state?.winningChain
+                ? `Kazanan coin: ${coinLabel(state.winningChain)}`
+                : `Kazanan, ${state?.coinPool?.length ?? 20} coin'lik havuzdan beacon ile seçilecek`}
             </span>
           </div>
 
@@ -193,7 +278,7 @@ export default function GamePage() {
           {state?.phase === 'result' && lastResult ? (
             <>
               <div className="muted" style={{ marginBottom: 6 }}>
-                Kazanan TXID ({CHAIN_LABEL[lastResult.winningChain]})
+                Kazanan TXID ({coinLabel(lastResult.winningChain)})
               </div>
               <RevealTxid txid={lastResult.winningTxid} />
               {toast && (
@@ -221,6 +306,29 @@ export default function GamePage() {
               Sonucun kaynağı bahisler kilitlenmeden açıklanmaz (provably fair).
             </div>
           )}
+
+          <div style={{ marginTop: 12 }}>
+            <div className="muted" style={{ marginBottom: 6 }}>
+              Bu turun coin havuzu ({state?.coinPool?.length ?? 0} coin · commit + tur
+              id&apos;den türetilir, doğrulanabilir)
+            </div>
+            <div className="row" style={{ flexWrap: 'wrap', gap: 6 }}>
+              {state?.coinPool?.map((c) => (
+                <span
+                  key={c.id}
+                  className="pill"
+                  style={
+                    state.winningChain === c.id
+                      ? { borderColor: 'var(--accent-2)', color: 'var(--accent-2)' }
+                      : undefined
+                  }
+                  title={c.name}
+                >
+                  {c.id}
+                </span>
+              ))}
+            </div>
+          </div>
         </div>
 
         <div className="card">
@@ -236,7 +344,7 @@ export default function GamePage() {
             </div>
           </div>
           <div className="muted" style={{ marginTop: 10 }}>
-            Canlı havuz: <b>{(state?.totalStaked ?? 0).toFixed(2)}</b> ·{' '}
+            Canlı havuz: <b>{(state?.totalStaked ?? 0).toFixed(2)}</b> USD ·{' '}
             {state?.betCount ?? 0} bahis
           </div>
         </div>
@@ -246,9 +354,7 @@ export default function GamePage() {
         <h2>Bahis Yap</h2>
         <div className="bet-types">
           {BET_OPTIONS.map((opt) => {
-            const item = catalogue.find((c) => c.type === opt.type);
-            const mult =
-              item && state ? item.multipliers[state.winningChain] : 0;
+            const r = state?.multiplierRanges?.[opt.type];
             return (
               <button
                 key={opt.id}
@@ -256,24 +362,40 @@ export default function GamePage() {
                 onClick={() => setSelected(opt)}
               >
                 <div className="label">{opt.label}</div>
-                <div className="mult">{mult ? `${mult.toFixed(2)}x` : '—'}</div>
+                <div className="mult">
+                  {r
+                    ? r.min === r.max
+                      ? `${r.min.toFixed(2)}x`
+                      : `${r.min.toFixed(2)}–${r.max.toFixed(2)}x`
+                    : '—'}
+                </div>
               </button>
             );
           })}
         </div>
+        <div className="muted" style={{ marginTop: 6 }}>
+          Oran aralığı: kazanan coin havuzdan çıkar; oran kazanan coin&apos;in
+          alfabesine göre kesinleşir (hex / base58).
+        </div>
 
-        <div className="row" style={{ marginTop: 14 }}>
+        <div className="row" style={{ marginTop: 14, flexWrap: 'wrap' }}>
           <span className="muted">Tutar</span>
           <input
             type="number"
-            min={0.5}
+            min={limits?.min ?? 0.5}
             step={0.5}
             value={amount}
             onChange={(e) => setAmount(Number(e.target.value))}
             style={{ width: 120 }}
           />
           <span className="muted">
-            Olası ödeme: {(amount * multiplier).toFixed(2)} {player?.currency}
+            Olası ödeme:{' '}
+            {range
+              ? range.min === range.max
+                ? (amount * range.min).toFixed(2)
+                : `${(amount * range.min).toFixed(2)}–${(amount * range.max).toFixed(2)}`
+              : '—'}{' '}
+            {player?.currency}
           </span>
           <button
             className="btn"
@@ -284,6 +406,25 @@ export default function GamePage() {
             {canBet ? `Bahis Yap (${selected.label})` : 'Bahis Kapalı'}
           </button>
         </div>
+
+        <div className="row" style={{ marginTop: 10, flexWrap: 'wrap' }}>
+          <span className="muted">Oto Doldur</span>
+          <select
+            value={autoCount}
+            onChange={(e) => setAutoCount(Number(e.target.value))}
+            title="Kaç bahis otomatik doldurulsun"
+          >
+            <option value={3}>3 bahis</option>
+            <option value={5}>5 bahis</option>
+            <option value={10}>10 bahis</option>
+          </select>
+          <button className="btn" disabled={!canBet} onClick={onAutoPick}>
+            Oto Doldur ({autoCount} × {amount} {player?.currency ?? currency})
+          </button>
+          <span className="muted">
+            Oto seçim elle seçimle birebir aynı oran tablosunu kullanır.
+          </span>
+        </div>
       </div>
 
       <div className="card" style={{ marginTop: 16 }}>
@@ -292,7 +433,7 @@ export default function GamePage() {
         {history.map((h) => (
           <div className="history-row" key={h.roundId}>
             <span>
-              #{h.index} · {CHAIN_LABEL[h.winningChain]}
+              #{h.index} · {coinLabel(h.winningChain)}
             </span>
             <span className="mono">…{h.winningTxid.slice(-10)}</span>
             <Link href={`/verify?roundId=${h.roundId}`}>doğrula</Link>

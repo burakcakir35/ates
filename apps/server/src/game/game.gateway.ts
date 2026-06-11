@@ -27,6 +27,12 @@ interface BetPayload {
   amount: number;
 }
 
+interface AutoPickPayload {
+  playerId: string;
+  count: number;
+  amount: number;
+}
+
 @WebSocketGateway({ cors: { origin: '*' } })
 export class GameGateway
   implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
@@ -89,6 +95,7 @@ export class GameGateway
         balance: player.balance,
         streak: player.streak,
       },
+      limits: this.game.betLimitsFor(player.currency),
       state: this.game.getPublicState(),
     };
   }
@@ -103,6 +110,20 @@ export class GameGateway
         amount: payload.amount,
       });
       return { ok: true, betId: bet.id };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  @SubscribeMessage('bet:autopick')
+  onAutoPick(@MessageBody() payload: AutoPickPayload) {
+    try {
+      const { placed } = this.game.autoPlaceBets(
+        payload.playerId,
+        payload.count,
+        payload.amount,
+      );
+      return { ok: true, placed };
     } catch (err) {
       return { ok: false, error: (err as Error).message };
     }

@@ -12,6 +12,7 @@ interface VerifyResult {
   serverSeed: string;
   beacon: Record<string, string>;
   resultHash: string;
+  coinPool: string[];
   winningChain: string;
   winningTxid: string;
 }
@@ -71,7 +72,9 @@ function VerifyInner() {
         </div>
         <p className="muted">
           Sunucu, açıklanan server seed + zincir beacon hash&apos;lerinden sonucu
-          yeniden hesaplar. Aynı kazanan TXID çıkıyorsa tur adildir.
+          yeniden hesaplar. 20-coin havuzu commit + tur id&apos;den, kazanan coin
+          ise sonuç hash&apos;inden yeniden türetilir. Hepsi birebir eşleşiyorsa
+          tur adildir.
         </p>
 
         {error && <div className="toast err">{error}</div>}
@@ -107,8 +110,14 @@ function VerifyInner() {
                   <th>Result Hash</th>
                   <td className="mono">{result.resultHash}</td>
                 </tr>
+                {result.coinPool && (
+                  <tr>
+                    <th>Coin Havuzu ({result.coinPool.length})</th>
+                    <td className="mono">{result.coinPool.join(' · ')}</td>
+                  </tr>
+                )}
                 <tr>
-                  <th>Kazanan Zincir</th>
+                  <th>Kazanan Coin (havuzdan)</th>
                   <td>{result.winningChain}</td>
                 </tr>
                 <tr>
