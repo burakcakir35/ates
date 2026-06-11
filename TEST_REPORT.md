@@ -288,3 +288,94 @@ pnpm --filter @ates/web dev        # :3000
 # engine + integration harnesses used in this report were run as standalone
 # Node scripts importing the built engine / a scripted socket.io-client.
 ```
+
+---
+
+## 7. Canlı Test Rehberi (tarayıcıdan, teknik olmayan dille)
+
+Bu bölüm, üç özelliği ve çekirdeğin bozulmadığını kendi gözünle tarayıcıdan test
+edebilmen için adım adım yazılmıştır. Her madde "şunu yap → şunu görmelisin"
+biçimindedir.
+
+### 0. Başlatma
+1. Terminalde sırayla çalıştır:
+   ```bash
+   pnpm install && pnpm build
+   pnpm --filter @ates/server start   # 1. terminal — sunucu :4000
+   pnpm --filter @ates/web dev        # 2. terminal — web :3000
+   ```
+2. Tarayıcıda **http://localhost:3000** adresine git.
+3. Başlangıçta görmelisin: sağ üstte **● Bağlı**, bakiye **$1000.00 (USD)**,
+   **Min bahis: $0.50**, ortada geri sayımlı bir tur (BAHİS AÇIK), altında "Bu
+   turun coin havuzu", "Bahis Yap" kartı ve "Oto Doldur" düğmesi.
+   - **YANLIŞ varsa:** "○ Bağlanıyor" takılı kalırsa sunucu (:4000) çalışmıyordur.
+
+### 1. 20-coin havuzunu görmek
+- **Yap:** Ana sayfada "Bu turun coin havuzu" yazısının altına bak.
+  - **DOĞRU:** Tam **20 adet** coin rozeti listelenir (BTC, ETH, SOL, ADA, …).
+    Başlıkta "(20 coin · commit + tur id'den türetilir, doğrulanabilir)" yazar.
+  - **YANLIŞ:** 4 coin veya sabit aynı liste görürsen havuz özelliği çalışmıyordur.
+- **Yap:** 2–3 tur bekle (her tur ~29 sn). Her yeni turda havuza tekrar bak.
+  - **DOĞRU:** Coin listesi ve sırası **her turda değişir** (önceden tahmin edilemez).
+  - **YANLIŞ:** Liste hiç değişmiyorsa seçim deterministik/tahmin edilebilir demektir.
+- **Yap:** Bir tur bitince sonuç ekranında "Kazanan coin" rozeti havuzda
+  **vurgulanır** (yeşil çerçeve). Ardından "Doğrula: bu turun adaletini kontrol
+  et" bağlantısına tıkla.
+  - **DOĞRU:** Doğrulama sayfasında üstte yeşil **"✓ Doğrulandı — sonuç açıklanan
+    girdilerle birebir yeniden üretildi."** çıkar; tabloda **Coin Havuzu (20)**,
+    **Kazanan Coin (havuzdan)** ve **Kazanan TXID** birlikte gösterilir. Yani
+    "bu 20 coin neden seçildi" de kanıtlanır.
+  - **YANLIŞ:** Kırmızı "✗ Doğrulama başarısız" çıkarsa girdiler sonuçla
+    eşleşmiyordur.
+- **Manipülasyon (bozma) kontrolü:** Doğrulama sayfası girdileri sunucudan dürüst
+  çeker, bu yüzden ekrandan elle bozamazsın. Bozma testi motor testleriyle
+  otomatik koşar: tohum/tur id/havuz/TXID'den biri değiştirilirse doğrulama
+  **false** döner (`pnpm test` → `pool.test.ts` ve `fairness.test.ts`).
+
+### 2. Fiat dönüşümünü görmek
+- **Yap:** Sağ üstteki **"Para birimi"** açılır menüsünden **TRY** seç.
+  - **DOĞRU:** Sayfa yenilenir; bakiye **₺1000.00**, **Min bahis: ₺20.50** olur
+    (= 0,50 USD'nin TRY karşılığı). Para birimi değişince o para biriminde yeni
+    bir oyuncu profili açılır. EUR/GBP/USD için de eşik kura göre değişir.
+- **Yap (mock yatırım):** "Cüzdan (mock)" satırında coin **USDT**, tutar **100**
+  iken **"Yatır (coin → TRY)"** düğmesine bas.
+  - **DOĞRU:** Üstte yeşil mesaj: **"Yatırım: 100 USDT → 4100.00 TRY (kur
+    41.0000)"**; bakiye **₺1000 → ₺5100** olur. Hemen altında "Son işlem:
+    yatırım · 100 USDT ↔ 4100 TRY · kur 41.0000" (orijinal coin + kur + sonuç
+    fiat kaydı).
+- **Yap (min bahis eşiği — negatif kontrol):** TRY profilindeyken bahis tutarını
+  **5** bırak ve herhangi bir bahis düğmesine bas.
+  - **DOĞRU:** Kırmızı uyarı: **"Minimum bet is 20.5 TRY (0.5 USD)"**, bakiye
+    **değişmez**. Tutarı 20.50 veya üzeri yapınca bahis kabul edilir.
+- **Yap (mock çekim):** Bir coin seç, tutar gir, **"Çek (TRY → coin)"** bas.
+  - **DOĞRU:** Yeşil mesaj fiat→coin dönüşümünü ve kuru gösterir; bakiyeden
+    düşülür. Bakiyeden fazlasını çekmeye çalışırsan "Insufficient balance" reddi gelir.
+
+### 3. Oto-doldur'u görmek
+- **Yap:** "Bahis Yap" kartının altındaki **"Oto Doldur"** satırında hane sayısını
+  (**3 / 5 / 10**) seç, tutarı belirle, **"Oto Doldur (n × tutar)"** düğmesine bas.
+  - **DOĞRU:** Yeşil mesaj **"Oto doldur: 3 bahis alındı (her biri 5 …)"**; bakiye
+    tam **n × tutar** kadar düşer (örn. 3×5 = 15), canlı havuzdaki bahis sayısı artar.
+  - **YANLIŞ:** Hiç bahis girilmez veya bakiye yanlış düşerse sorun var demektir.
+- **Adalet (avantaj yok):** Oto-doldur, elle seçimle **birebir aynı** bahis havuzunu
+  ve oran tablosunu kullanır (kod: `engine/src/autopick.ts` → `AUTO_PICK_SPACE`).
+  İstatistik testi 10.000 oto vs 10.000 elle seçimin aynı RTP'yi (≈%94) verdiğini
+  doğrular (`pnpm test` → `autopick.test.ts`). UI'da da oran düğmelerinin çarpanları
+  elle ve oto için aynıdır.
+
+### 4. Çekirdeğin bozulmadığını görmek (regresyon)
+- **Normal bahis:** USD profiline dön, bir bahis türü seç, tutar gir, "Bahis Yap".
+  - **DOĞRU:** Bakiye anında **tutar kadar düşer** ("Bahis alındı" mesajı). Tur
+    bitince **kazandıysan** "Kazandın! +X" yeşil mesajı çıkar, bakiye ödeme kadar
+    artar, **Streak** +1 olur; **kaybettiysen** "Bu tur kaybettin", stake geri gelmez.
+- **Jackpot:** Sağdaki "Jackpot" kartında **Major/Grand** havuzları görünür; aynısı
+  **http://localhost:3000/admin** sayfasında "Jackpot Havuzları" altında ve oyun
+  oynandıkça büyür. Admin'de ayrıca oyuncu sayısı, oynanan tur, toplam bahis/ödeme
+  ve **Ev kâr/zarar (P&L)** görürsün.
+- **Geri sayım biterken bahis (kilit testi):** Geri sayım 0'a yaklaşırken / "SONUÇ
+  HESAPLANIYOR" anında bahis koymayı dene.
+  - **DOĞRU:** Düğme **"Bahis Kapalı"** olur ve bahis **reddedilir**, bakiye değişmez.
+
+> Not (prototip sınırları): Admin paneli kimlik doğrulamasızdır, durum bellekte
+> tutulur (sunucu yeniden başlarsa sıfırlanır) ve beacon simüledir. Bunlar
+> üretimde kapatılması gereken, README ve bu raporda işaretli kalemlerdir.
