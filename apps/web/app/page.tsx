@@ -71,6 +71,9 @@ export default function GamePage() {
   const [walletAmount, setWalletAmount] = useState(100);
   const [depositCoins, setDepositCoins] = useState<string[]>([]);
   const [lastTx, setLastTx] = useState<WalletTx | null>(null);
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => setMounted(true), []);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 200);
@@ -179,6 +182,14 @@ export default function GamePage() {
     }
   }
 
+  if (!mounted) {
+    return (
+      <div className="container">
+        <div className="card muted">Yükleniyor…</div>
+      </div>
+    );
+  }
+
   return (
     <div className="container">
       <div className="topbar">
@@ -193,6 +204,12 @@ export default function GamePage() {
           <span className={`pill`}>{connected ? '● Bağlı' : '○ Bağlanıyor'}</span>
         </div>
       </div>
+
+      {toast && (
+        <div className={`toast ${toast.kind}`} style={{ marginBottom: 16 }}>
+          {toast.msg}
+        </div>
+      )}
 
       <div className="card" style={{ marginBottom: 16 }}>
         <div className="wallet">
@@ -292,9 +309,6 @@ export default function GamePage() {
                 Kazanan TXID ({coinLabel(lastResult.winningChain)})
               </div>
               <RevealTxid txid={lastResult.winningTxid} />
-              {toast && (
-                <div className={`toast ${toast.kind}`}>{toast.msg}</div>
-              )}
               {lastResult.awards.length > 0 && (
                 <div className="toast win">
                   🎉 Jackpot:{' '}
