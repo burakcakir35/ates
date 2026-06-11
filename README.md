@@ -44,9 +44,11 @@ apps/server       NestJS + Socket.IO realtime game server (in-memory state)
                   - round lifecycle state machine (betting → locking → result)
                   - play-money wallets, bet placement, jackpots
                   - REST: /api/health, /api/config, /api/bet-types,
-                    /api/rounds/recent, /api/verify/:roundId, /api/admin/stats
+                    /api/rounds/recent, /api/verify/:roundId
+                  - admin API (auth + RBAC): /api/admin/login,
+                    /api/admin/stats, /api/admin/players (see apps/server/src/admin)
 
-apps/web          Next.js player UI + admin view + verification page
+apps/web          Next.js player UI + (authenticated) admin panel + verify page
 ```
 
 The engine is deliberately separate and pure so the fairness maths can be
@@ -114,7 +116,9 @@ ship without the proper professional work:
   custody, on-chain reconciliation.
 - KYC/AML, geo-blocking, responsible-gaming enforcement, audit/WORM logging.
 - Gambling licensing and any legal/tax/compliance obligations.
-- Admin authentication boundary (RBAC + mandatory 2FA + IP allowlist). The admin
-  endpoints here are open for local demoing only.
+- Admin authentication is implemented (login + RBAC roles: superadmin / finance /
+  support / readonly; player access to /api/admin/* returns 401/403). Remaining
+  production P0: mandatory 2FA + IP allowlist. Local dev passwords default to
+  `<role><role>123` and are overridable via `ADMIN_<ROLE>_PASSWORD` env vars.
 - Persistent storage (PostgreSQL/Redis). State is in-memory and resets on
   restart.

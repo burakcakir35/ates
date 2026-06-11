@@ -1,5 +1,6 @@
 import { randomInt } from 'crypto';
 import { BetSelection, BetTypeId } from './bets';
+import { complementaryGroup } from './constraints';
 
 export interface AutoPick {
   type: BetTypeId;
@@ -22,14 +23,31 @@ export const AUTO_PICK_SPACE: AutoPick[] = [
   { type: 'SUM_PARITY', selection: { parity: 'odd' } },
 ];
 
-/** Generate `count` uniformly random picks from the manual bet space. */
+/**
+ * Generate `count` uniformly random picks from the manual bet space.
+ *
+ * Picks honour the same counter-bet rule as manual play: the first time a
+ * complementary group is drawn its side is locked in, and later draws that land
+ * on the opposite side reuse the locked side instead. This means auto-pick can
+ * never assemble a guaranteed-win set, exactly like a player betting by hand.
+ */
 export function autoPick(count: number): AutoPick[] {
   if (!Number.isInteger(count) || count < 1 || count > 20) {
     throw new Error('count must be an integer between 1 and 20');
   }
   const picks: AutoPick[] = [];
+  const lockedMember = new Map<string, AutoPick>();
   for (let i = 0; i < count; i += 1) {
-    const choice = AUTO_PICK_SPACE[randomInt(AUTO_PICK_SPACE.length)];
+    let choice = AUTO_PICK_SPACE[randomInt(AUTO_PICK_SPACE.length)];
+    const group = complementaryGroup(choice.type, choice.selection);
+    if (group) {
+      const locked = lockedMember.get(group.group);
+      if (locked) {
+        choice = locked;
+      } else {
+        lockedMember.set(group.group, choice);
+      }
+    }
     picks.push({ type: choice.type, selection: { ...choice.selection } });
   }
   return picks;

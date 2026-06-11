@@ -29,6 +29,37 @@ describe('RTP simulation', () => {
     expect(rtp).toBeLessThan(expected + 0.03);
   });
 
+  it('betting the WHOLE complementary set still yields RTP ~0.94 and never > 1.0', () => {
+    // The "arbitrage" attempt: cover both sides of a 50/50 set every round.
+    // Pure betting math must still bleed the player at the house edge — there is
+    // no risk-free profit once the jackpot streak (the real leak) is removed by
+    // the counter-bet constraint. (This run skips the constraint to prove the
+    // odds themselves are sound.)
+    const N = 40000;
+    let staked = 0;
+    let paid = 0;
+    let maxRoundReturnRatio = 0;
+    for (let i = 0; i < N; i += 1) {
+      const txid = generateTxid('BTC', `arb-${i}`);
+      const bets: PlacedBet[] = [
+        { id: `e${i}`, playerId: 'p', type: 'LAST_CHAR_PARITY', selection: { parity: 'even' }, amount: 1 },
+        { id: `o${i}`, playerId: 'p', type: 'LAST_CHAR_PARITY', selection: { parity: 'odd' }, amount: 1 },
+      ];
+      const s = settleRound(bets, 'BTC', txid, 0.06);
+      staked += s.totalStaked;
+      paid += s.totalPaidOut;
+      maxRoundReturnRatio = Math.max(
+        maxRoundReturnRatio,
+        s.totalPaidOut / s.totalStaked,
+      );
+    }
+    const rtp = paid / staked;
+    expect(rtp).toBeGreaterThan(0.91);
+    expect(rtp).toBeLessThan(0.97);
+    // No single round of the full-set strategy ever returns more than staked.
+    expect(maxRoundReturnRatio).toBeLessThan(1.0);
+  });
+
   it('empirical last-char-digit frequency matches 10/16 for hex', () => {
     const N = 40000;
     let digits = 0;

@@ -133,14 +133,4 @@ export class ApiController {
       winningTxid: round.winningTxid,
     };
   }
-
-  /**
-   * Operator stats. NOTE: in production this must sit behind the admin auth
-   * boundary (RBAC + 2FA + IP allowlist) described in the spec. It is open here
-   * only because this is a local play-money prototype.
-   */
-  @Get('admin/stats')
-  adminStats() {
-    return this.game.getStats();
-  }
 }

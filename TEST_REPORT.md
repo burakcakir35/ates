@@ -14,13 +14,18 @@ Production-only concerns (admin auth, persistence, real beacon) remain flagged.
 
 Toolchain gate (all green):
 ```
-pnpm test       -> engine 39 passed, server 11 passed (50 total)
+pnpm test       -> engine 47 passed, server 24 passed (71 total)
 pnpm typecheck  -> 3/3 packages OK
 pnpm lint       -> 3/3 packages, no warnings/errors
 pnpm build      -> OK (dist emitted)
 ```
 Live harness totals: engine adversarial 41/41 · WS integration 37/37 ·
 new-features live 28/28 · exposure cap 2/2.
+
+> **Update (Section 10):** two critical issues were addressed after the initial
+> report — the **risk-free counter-bet (arbitrage) exploit** and **admin/player
+> panel separation**. See [Section 10](#10-arbitraj-açığı-düzeltmesi--panel-ayrımı)
+> for the diagnosis (with numbers), the fix, and the new tests.
 
 ---
 
@@ -376,6 +381,181 @@ biçimindedir.
   HESAPLANIYOR" anında bahis koymayı dene.
   - **DOĞRU:** Düğme **"Bahis Kapalı"** olur ve bahis **reddedilir**, bakiye değişmez.
 
-> Not (prototip sınırları): Admin paneli kimlik doğrulamasızdır, durum bellekte
-> tutulur (sunucu yeniden başlarsa sıfırlanır) ve beacon simüledir. Bunlar
-> üretimde kapatılması gereken, README ve bu raporda işaretli kalemlerdir.
+> Not (prototip sınırları): Durum bellekte tutulur (sunucu yeniden başlarsa
+> sıfırlanır) ve beacon simüledir. Admin paneli **artık kimlik doğrulamalıdır**
+> (giriş + RBAC, Bölüm 10); üretim için kalan P0 kalemler 2FA + IP allowlist'tir.
+
+---
+
+## 10. Arbitraj açığı düzeltmesi + Panel ayrımı
+
+İki kritik konu **TEŞHİS → DÜZELTME → TEST** akışıyla ele alındı.
+
+### 10.A — Arbitraj / risksiz kazanç: TEŞHİS (sayılarla)
+
+**Belirti:** Karşıt bahisler (örn. TEK + ÇİFT) aynı turda oynanınca lokal testte
+5000 → 62000 büyüme; ev sürekli kaybediyor.
+
+**1) Tamamlayan (mutually exclusive + collectively exhaustive) kümeler:**
+`{RAKAM, HARF}`, `{son-karakter ÇİFT, TEK}`, `{ilk-karakter YÜKSEK, DÜŞÜK}`,
+`{toplam ÇİFT, TEK}`.
+
+**2) Oran matematiği DOĞRU (kök neden DEĞİL).** Her küme için, her coin'de:
+- Olasılıklar **tam 1.0'a** toplanıyor (`betProbability` toplamı |Σp − 1| < 1e-9).
+- **Dutch book yok:** `Σ(1/oran) ≈ 1/0.94 = 1.0638 > 1`. Bu, kümenin tamamına
+  hangi dağılımla oynarsan oyna **garanti kâr imkânsız** demektir.
+- 50/50 kümelerde her bahsin oranı **1.88 < 2**; iki tarafa 1+1 birim oynayan
+  oyuncu **her sonuçta 1.88 < 2 alır → garanti kayıp** (RTP ≈ 0.94).
+
+  Kanıt testi: `packages/engine/test/constraints.test.ts` →
+  "no Dutch book", "50/50 sets pay strictly less than the combined stake".
+
+**3) Asıl kök neden — jackpot streak'i.** `processJackpots`, oyuncunun o turda
+**herhangi bir** bahsi kazanırsa turu "kazanıldı" sayıp streak'i artırıyor.
+Karşıt bahis **her tur garanti bir kazanç** ürettiği için streak hiç sıfırlanmıyor
+→ MINI(×10)/MINOR(×20) gibi **sabit, evden basılan** ödüller sürekli tetikleniyor.
+Asıl şişme buradan geliyor.
+
+  Sayısal teşhis (`/tmp/ates_diag.mjs`, 1000 tur, stake 5, deterministik):
+  - Karşıt (TEK+ÇİFT her tur): **5000 → 225.449** (streak hiç kırılmıyor).
+  - Tek yönlü tek bahis: ~17.000 (streak sık kırılıyor; saf bahis RTP ≈ 0.94).
+
+  → Yani açık, oran formülünde değil; **garantili-kazanç + streak jackpot**
+  kombinasyonundadır.
+
+### 10.B — DÜZELTME (iki katman)
+
+**B1 — Oran matematiği (kök neden teyidi):** Oran `(1/p)×(1−0.06)` formülü zaten
+doğru; olasılıklar tam 1.0'a toplanıyor. Değiştirilmedi; bunun yerine
+**iddialar testlerle kilitlendi** (Σp=1, Dutch book yok, 50/50 < 2). Böylece
+ileride bir regresyon oranları bozarsa test kırmızı verir.
+
+**B2 — Karşıt-bahis kısıtı (sunucu tarafında zorunlu):**
+- Yeni `packages/engine/src/constraints.ts`: `complementaryGroup()` ve
+  `isCounterBet()` — bir bahsin hangi tamamlayan kümeye ait olduğunu ve iki
+  bahsin karşıt olup olmadığını belirler.
+- `GameService.placeBet`: aynı oyuncu aynı turda **aynı kümenin karşıt tarafına**
+  bahis koyamaz → `Error("Counter-bet not allowed: …")`. (Aynı tarafı tekrar
+  oynamak serbest; bu garanti kazanç değildir.) Client'a güvenilmez; kural
+  **sunucuda**.
+- `autoPick` (engine) zaten küme-içi kilitli; `GameService.autoPlaceBets` ayrıca
+  oyuncunun **elle koyduğu** bahisleri de hesaba katar → oto-doldur asla garanti
+  kazanç kümesi tamamlamaz.
+- Web UI (`apps/web/app/page.tsx`): bir tarafı oynayınca karşıt düğme **kilitli**
+  görünür (yalnızca görsel; asıl kural sunucuda).
+
+### 10.C — TEST (negatif kontrollerle)
+
+| Test | Beklenen | Sonuç |
+|------|----------|-------|
+| `constraints.test.ts` — Σp=1, no Dutch book, 50/50<2 | oran matematiği sağlam | **PASS** |
+| `constraints.test.ts` — `isCounterBet` doğru/yanlış sınıflama | karşıtları yakalar, aynı tarafı yakalamaz | **PASS** |
+| `constraints.test.ts` — `autoPick(20)` 200 denemede | hiçbir kümede iki taraf yok | **PASS** |
+| `rtp.test.ts` — tüm kümeye oyna (40k tur) | RTP 0.91–0.97, tek turda getiri/stake < 1.0 | **PASS** (asla >1.0) |
+| `features.test.ts` — aynı turda TEK sonra ÇİFT | 2.si reddedilir | **PASS** |
+| `features.test.ts` — RAKAM sonra HARF | 2.si reddedilir | **PASS** |
+| `features.test.ts` — aynı tarafı 2× / farklı oyuncu karşıt taraf | izin verilir | **PASS** |
+| `features.test.ts` — elle bahis + oto-doldur(20) | hata fırlatmaz, çakışma yok | **PASS** |
+
+**"5000 → 62000 artık imkânsız" kanıtı** (`/tmp/ates_repro.mjs`, `GameService`
+üzerinden):
+```
+start balance: 1000
+placed TEK/even: ok
+placed CIFT/odd: REJECTED -> Counter-bet not allowed: …
+placed RAKAM+HARF: REJECTED -> Counter-bet not allowed: …
+autoPick(20) assembled a guaranteed-win set? NO (safe)
+```
+Garantili-kazanç kümesi artık oluşturulamadığı için streak'i suni besleyen
+mekanizma ortadan kalkar; saf bahis matematiği zaten her sonuçta < 1.0 (RTP ≈
+0.94) döndürür.
+
+**Regresyon:** RTP (analitik + Monte-Carlo), jackpot tier'leri, exposure cap,
+eşzamanlılık, provably-fair verify testleri **hâlâ PASS** (71/71).
+
+> **Dürüst not (ev dengesi, ayrı kalem):** Karşıt-bahis kısıtı **risksiz
+> (sıfır-varyanslı)** arbitrajı tamamen kapatır. Ayrı bir gözlem: MINI/MINOR
+> sabit çarpanları evden basıldığı için, p=0.5 tek tarafa sabırla oynayıp
+> **streak avlayan** bir oyuncu hâlâ pozitif beklenen değer elde edebilir (tek
+> bahis simülasyonu ~3× büyüme). Bu, arbitraj değil **jackpot tuning** konusudur
+> ve "jackpot mekaniğini bozma" talimatı gereği bu PR'da değiştirilmedi; üretim
+> öncesi MINI/MINOR'ı havuzdan fonlamak veya eşikleri yükseltmek **P1 öneri**
+> olarak işaretlidir.
+
+### 10.D — Admin / Oyuncu paneli ayrımı
+
+**DENETİM (önceki durum):** Admin işlevi **aynı** serviste (`ApiController` →
+`GET /api/admin/stats`, authsuz) ve **aynı** web uygulamasında (`/admin`) idi.
+Oyuncu URL'i bilerek admin verisine erişebiliyordu. Ayrı kimlik/oturum yoktu.
+
+**AYIR (yeni durum):**
+- Admin API ayrı bir modüle taşındı: `apps/server/src/admin/` →
+  `AdminController` (`/api/admin/*`), `AdminAuthService`, `AdminGuard`, `roles.ts`.
+- **Kimlik doğrulama:** `POST /api/admin/login` (kullanıcı/şifre → opak bearer
+  token, 1 saat TTL). Diğer tüm admin uçları `AdminGuard` arkasında.
+- **RBAC rolleri:** `superadmin` / `finance` / `support` / `readonly`. Yazma
+  uçları izin ister (`@RequirePermission('balance:write')`); salt-okunur rol
+  yazamaz.
+- **İzolasyon:** authsuz veya sahte token ile admin ucu **401**; yetkisiz rol
+  **403**. Oyuncu oyun API'si (`/api/health`, WS) etkilenmez.
+- `ApiController`'daki authsuz `admin/stats` ucu **kaldırıldı**.
+- Web `/admin` artık **giriş ekranı** ile açılır; token `localStorage`'da tutulur,
+  401 alınca otomatik çıkış yapar.
+
+**Admin hesapları (yalnızca yerel prototip; şifreler env ile geçilebilir):**
+`superadmin/superadmin123`, `finance/finance123`, `support/support123`,
+`readonly/readonly123` (env: `ADMIN_SUPERADMIN_PASSWORD` vb.).
+
+**TEST — panel izolasyonu (canlı `curl`, sunucu `:4777`):**
+| İstek | Beklenen | Sonuç |
+|-------|----------|-------|
+| `GET /api/admin/stats` (tokensız) | 401 | **401** |
+| `GET /api/admin/stats` (sahte token) | 401 | **401** |
+| `GET /api/health` (oyuncu) | 200 | **200** |
+| `POST /api/admin/login` doğru şifre | token (64 hex) | **OK** |
+| `GET /api/admin/stats` (geçerli token) | 200 | **200** |
+| `POST /api/admin/login` yanlış şifre | 401 | **401** |
+| `readonly` → `POST …/players/:id/adjust` | 403 | **403** |
+| `readonly` → `GET …/stats` | 200 | **200** |
+
+Birim testleri: `apps/server/test/admin.test.ts` (login/verify/logout, RBAC) +
+`apps/server/test/admin.guard.test.ts` (401 tokensız/sahte, 403 yetkisiz rol,
+finance yazabilir). **PASS.**
+
+---
+
+## 11. CANLI DOĞRULAMA REHBERİ — Arbitraj kısıtı + Panel ayrımı
+
+> Tarayıcıdan kendi gözünle test et. Her madde "şunu yap → DOĞRU/YANLIŞ".
+
+### A. Aynı turda TEK **ve** ÇİFT oynamayı dene
+- **Yap:** Oyun ekranında (http://localhost:3000) bir tur **betting** aşamasındayken
+  "Son karakter ÇİFT"e tutar girip **Bahis Yap**. Sonra "Son karakter TEK"e bas.
+  - **DOĞRU:** "TEK" düğmesi **kilitli/soluk** görünür; yine de denersen kırmızı
+    mesaj: *"Aynı turda bu kümenin karşıt tarafını oynayamazsın…"* ve sunucu da
+    reddeder ("Counter-bet not allowed"). Aynısı RAKAM↔HARF, YÜKSEK↔DÜŞÜK,
+    Toplam ÇİFT↔TEK için geçerli.
+  - **YANLIŞ:** İkinci bahis kabul edilip bakiyeden düşülürse açık hâlâ açık demektir.
+
+### B. Karşıt kümeye "tam oyna" → bakiye erimeli (artmamalı)
+- **Yap:** Tek tarafa (örn. hep "ÇİFT") makul tutarla birçok tur üst üste oyna.
+  - **DOĞRU:** Karşıt tarafı **ekleyemediğin** için garanti kazanç kuramazsın;
+    uzun vadede bakiye **dalgalanır ve net erir** (her bahiste ~%6 ev avantajı).
+    Birkaç turda bir kazanırsın ama toplamda bakiye yukarı kaçmaz.
+  - **YANLIŞ:** Bakiye düzenli, risksiz şekilde sürekli artıyorsa sorun var.
+  - **Not:** Jackpot streak'i avlamaya çalışırsan ara sıra büyük sıçrama
+    görebilirsin — bu arbitraj değil, ayrı jackpot-tuning kalemidir (Bölüm 10.C notu).
+
+### C. Oyuncu olarak admin sayfasına girmeyi dene
+- **Yap:** Tarayıcıda **http://localhost:3000/admin** adresine git (giriş yapmadan).
+  - **DOĞRU:** **Operatör Girişi** ekranı çıkar; istatistik/oyuncu/jackpot verisi
+    **görünmez**. (API'yi doğrudan denersen `GET /api/admin/stats` → **401**.)
+  - **YANLIŞ:** Giriş olmadan panel ve veriler açılıyorsa ayrım yok demektir.
+
+### D. Admin olarak gir → panel açılır, rol kısıtı çalışır
+- **Yap:** `/admin` giriş ekranında `superadmin` / `superadmin123` ile gir.
+  - **DOĞRU:** Panel açılır: Genel/P&L, Jackpot, **Oyuncular** tablosu, Son Turlar.
+    Sağ üstte rol rozeti (`superadmin`) ve **Çıkış**.
+  - **Rol kısıtı:** `readonly` / `readonly123` ile girersen istatistikleri
+    **görürsün** ama bakiye değiştiren uç **403** döner (salt-okunur yazamaz).
+  - **YANLIŞ:** Yanlış şifre kabul edilirse veya readonly yazabiliyorsa sorun var.

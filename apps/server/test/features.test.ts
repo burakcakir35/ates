@@ -117,4 +117,98 @@ describe('auto-pick', () => {
     expect(() => svc.autoPlaceBets(player.id, 0, 2)).toThrow();
     expect(() => svc.autoPlaceBets(player.id, 3, 0.01)).toThrow(/Minimum bet/);
   });
+
+  it('large auto-pick never opens both sides of a complementary set', () => {
+    svc = new GameService();
+    svc.start();
+    const player = svc.registerPlayer(undefined, 'Auto3', 'USD');
+    // 20 picks at 2 each would blow the balance; use the smallest legal stake.
+    expect(() => svc.autoPlaceBets(player.id, 20, 0.5)).not.toThrow();
+    expect(svc.getPublicState().betCount).toBe(20);
+  });
+
+  it('auto-pick respects the sides the player already bet manually', () => {
+    svc = new GameService();
+    svc.start();
+    const player = svc.registerPlayer(undefined, 'Auto4', 'USD');
+    // Manually take every "even/low/digit" side first.
+    svc.placeBet({ playerId: player.id, type: 'LAST_CHAR_PARITY', selection: { parity: 'even' }, amount: 0.5 });
+    svc.placeBet({ playerId: player.id, type: 'SUM_PARITY', selection: { parity: 'even' }, amount: 0.5 });
+    svc.placeBet({ playerId: player.id, type: 'FIRST_CHAR_RANGE', selection: { range: 'low' }, amount: 0.5 });
+    svc.placeBet({ playerId: player.id, type: 'LAST_CHAR_DIGIT', selection: {}, amount: 0.5 });
+    // Auto-pick must never throw a counter-bet error against existing bets.
+    expect(() => svc.autoPlaceBets(player.id, 20, 0.5)).not.toThrow();
+    expect(svc.getPublicState().betCount).toBe(24);
+  });
+});
+
+describe('anti-arbitrage counter-bet constraint', () => {
+  let svc: GameService;
+  afterEach(() => svc?.stop());
+
+  it('rejects the opposite outcome of a set already bet this round', () => {
+    svc = new GameService();
+    svc.start();
+    const player = svc.registerPlayer(undefined, 'Arb', 'USD');
+    svc.placeBet({
+      playerId: player.id,
+      type: 'LAST_CHAR_PARITY',
+      selection: { parity: 'even' },
+      amount: 10,
+    });
+    expect(() =>
+      svc.placeBet({
+        playerId: player.id,
+        type: 'LAST_CHAR_PARITY',
+        selection: { parity: 'odd' },
+        amount: 10,
+      }),
+    ).toThrow(/Counter-bet not allowed/);
+    // digit + letter is also an exhaustive set
+    svc.placeBet({
+      playerId: player.id,
+      type: 'LAST_CHAR_DIGIT',
+      selection: {},
+      amount: 10,
+    });
+    expect(() =>
+      svc.placeBet({
+        playerId: player.id,
+        type: 'LAST_CHAR_LETTER',
+        selection: {},
+        amount: 10,
+      }),
+    ).toThrow(/Counter-bet not allowed/);
+  });
+
+  it('allows the same side twice and lets a different player bet the other side', () => {
+    svc = new GameService();
+    svc.start();
+    const p1 = svc.registerPlayer(undefined, 'P1', 'USD');
+    const p2 = svc.registerPlayer(undefined, 'P2', 'USD');
+    svc.placeBet({
+      playerId: p1.id,
+      type: 'LAST_CHAR_PARITY',
+      selection: { parity: 'even' },
+      amount: 10,
+    });
+    // same side again: fine (not a guaranteed win)
+    expect(() =>
+      svc.placeBet({
+        playerId: p1.id,
+        type: 'LAST_CHAR_PARITY',
+        selection: { parity: 'even' },
+        amount: 10,
+      }),
+    ).not.toThrow();
+    // the constraint is per-player, so a different player can take the other side
+    expect(() =>
+      svc.placeBet({
+        playerId: p2.id,
+        type: 'LAST_CHAR_PARITY',
+        selection: { parity: 'odd' },
+        amount: 10,
+      }),
+    ).not.toThrow();
+  });
 });

@@ -5,5 +5,6 @@ export * from './fairness';
 export * from './pool';
 export * from './autopick';
 export * from './bets';
+export * from './constraints';
 export * from './jackpot';
 export * from './settlement';

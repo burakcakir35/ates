@@ -17,8 +17,10 @@ import {
   deriveWinningTxid,
   generateServerSeed,
   getChain,
+  complementaryGroup,
   hasIdenticalTail,
   initJackpot,
+  isCounterBet,
   payoutMultiplier,
   selectCoinPool,
   selectWinningCoin,
@@ -147,6 +149,23 @@ export class GameService {
     // Validates the bet type/selection up front (throws on unknown type).
     this.maxPoolMultiplier(bet.type, bet.selection);
 
+    // Anti-arbitrage: reject a bet that completes a guaranteed-win counter-set
+    // (e.g. odd + even) this player already opened in the same round.
+    const conflict = this.round.bets.find(
+      (existing) =>
+        existing.playerId === player.id &&
+        isCounterBet(
+          { type: existing.type, selection: existing.selection },
+          { type: bet.type, selection: bet.selection },
+        ),
+    );
+    if (conflict) {
+      throw new Error(
+        'Counter-bet not allowed: you already bet the opposite outcome of this ' +
+          'set this round',
+      );
+    }
+
     // Risk control: worst-case exposure across the whole coin pool, in USD.
     const projected = this.projectedExposureUsd([...this.round.bets, bet]);
     if (projected > GAME_CONFIG.maxRoundExposure) {
@@ -166,10 +185,36 @@ export class GameService {
     count: number,
     amount: number,
   ): { placed: { betId: string; type: BetTypeId; selection: BetSelection }[] } {
-    const picks = autoPick(count);
+    // Lock in the side this player already committed for each complementary
+    // group so auto-pick can never complete a guaranteed-win counter-set
+    // (auto-pick is internally conflict-free; this also respects manual bets).
+    const locked = new Map<string, { type: BetTypeId; selection: BetSelection }>();
+    for (const existing of this.round.bets) {
+      if (existing.playerId !== playerId) {
+        continue;
+      }
+      const g = complementaryGroup(existing.type, existing.selection);
+      if (g) {
+        locked.set(g.group, {
+          type: existing.type,
+          selection: existing.selection,
+        });
+      }
+    }
+
     const placed: { betId: string; type: BetTypeId; selection: BetSelection }[] =
       [];
-    for (const pick of picks) {
+    for (const raw of autoPick(count)) {
+      let pick: { type: BetTypeId; selection: BetSelection } = raw;
+      const g = complementaryGroup(pick.type, pick.selection);
+      if (g) {
+        const lk = locked.get(g.group);
+        if (lk) {
+          pick = lk;
+        } else {
+          locked.set(g.group, pick);
+        }
+      }
       const bet = this.placeBet({
         playerId,
         type: pick.type,
@@ -592,6 +637,31 @@ export class GameService {
         grand: Math.round(this.jackpot.grand * 100) / 100,
       },
     };
+  }
+
+  /** Operator view of every player (admin-only; not exposed to players). */
+  listPlayers() {
+    return [...this.players.values()].map((p) => ({
+      id: p.id,
+      name: p.name,
+      currency: p.currency,
+      balance: p.balance,
+      streak: p.streak,
+    }));
+  }
+
+  /** Operator balance adjustment (credit/debit), used by the finance role. */
+  adjustBalance(playerId: string, delta: number) {
+    const player = this.players.get(playerId);
+    if (!player) {
+      throw new Error('Unknown player');
+    }
+    if (!Number.isFinite(delta)) {
+      throw new Error('Invalid amount');
+    }
+    player.balance = Math.round((player.balance + delta) * 100) / 100;
+    this.emitWallet(player);
+    return { id: player.id, balance: player.balance };
   }
 
   /** Bet catalogue with per-chain payout multipliers, for the UI. */

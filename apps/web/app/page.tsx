@@ -28,6 +28,37 @@ const BET_OPTIONS: BetOption[] = [
   { id: 'sumOdd', label: 'Toplam TEK', type: 'SUM_PARITY', selection: { parity: 'odd' } },
 ];
 
+/**
+ * Mirror of the engine's complementary-group rule so the UI can grey out the
+ * opposite side of a set the player already bet this round (the server enforces
+ * it regardless; this just makes the rule visible before the request).
+ */
+function groupOf(
+  type: string,
+  selection: Record<string, unknown>,
+): { group: string; member: string } | null {
+  switch (type) {
+    case 'LAST_CHAR_DIGIT':
+      return { group: 'last-char-class', member: 'digit' };
+    case 'LAST_CHAR_LETTER':
+      return { group: 'last-char-class', member: 'letter' };
+    case 'LAST_CHAR_PARITY':
+      return selection.parity
+        ? { group: 'last-char-parity', member: String(selection.parity) }
+        : null;
+    case 'FIRST_CHAR_RANGE':
+      return selection.range
+        ? { group: 'first-char-range', member: String(selection.range) }
+        : null;
+    case 'SUM_PARITY':
+      return selection.parity
+        ? { group: 'sum-parity', member: String(selection.parity) }
+        : null;
+    default:
+      return null;
+  }
+}
+
 function RevealTxid({ txid }: { txid: string }) {
   // Highlight the last character (most bets resolve on it).
   return (
@@ -66,6 +97,7 @@ export default function GamePage() {
   const [autoCount, setAutoCount] = useState(3);
   const [now, setNow] = useState(Date.now());
   const [toast, setToast] = useState<{ kind: string; msg: string } | null>(null);
+  const [myGroups, setMyGroups] = useState<Record<string, string>>({});
   const [history, setHistory] = useState<SettledRound[]>([]);
   const [walletCoin, setWalletCoin] = useState('USDT');
   const [walletAmount, setWalletAmount] = useState(100);
@@ -128,12 +160,27 @@ export default function GamePage() {
 
   const canBet = state?.phase === 'betting' && connected && !!player;
 
+  // Reset the per-round counter-bet tracking whenever a new round starts.
+  const roundId = state?.roundId;
+  useEffect(() => {
+    setMyGroups({});
+  }, [roundId]);
+
   async function onPlace() {
     setToast(null);
+    const g = groupOf(selected.type, selected.selection);
+    if (g && myGroups[g.group] && myGroups[g.group] !== g.member) {
+      setToast({
+        kind: 'err',
+        msg: 'Aynı turda bu kümenin karşıt tarafını oynayamazsın (risksiz bahis engellendi).',
+      });
+      return;
+    }
     const resp = await placeBet(selected.type, selected.selection, amount);
     if (!resp.ok) {
       setToast({ kind: 'err', msg: resp.error ?? 'Bahis başarısız' });
     } else {
+      if (g) setMyGroups((m) => ({ ...m, [g.group]: g.member }));
       setToast({ kind: 'win', msg: `Bahis alındı: ${selected.label}` });
     }
   }
@@ -144,6 +191,14 @@ export default function GamePage() {
     if (!resp.ok) {
       setToast({ kind: 'err', msg: resp.error ?? 'Oto doldur başarısız' });
     } else {
+      setMyGroups((m) => {
+        const next = { ...m };
+        for (const p of resp.placed ?? []) {
+          const g = groupOf(p.type, p.selection);
+          if (g && !next[g.group]) next[g.group] = g.member;
+        }
+        return next;
+      });
       setToast({
         kind: 'win',
         msg: `Oto doldur: ${resp.placed?.length ?? 0} bahis alındı (her biri ${amount} ${player?.currency})`,
@@ -380,19 +435,31 @@ export default function GamePage() {
         <div className="bet-types">
           {BET_OPTIONS.map((opt) => {
             const r = state?.multiplierRanges?.[opt.type];
+            const g = groupOf(opt.type, opt.selection);
+            const blocked =
+              !!g && !!myGroups[g.group] && myGroups[g.group] !== g.member;
             return (
               <button
                 key={opt.id}
                 className={`bet-btn ${selected.id === opt.id ? 'active' : ''}`}
-                onClick={() => setSelected(opt)}
+                onClick={() => !blocked && setSelected(opt)}
+                disabled={blocked}
+                title={
+                  blocked
+                    ? 'Bu turda bu kümenin diğer tarafını oynadın — karşıt bahis engellendi'
+                    : undefined
+                }
+                style={blocked ? { opacity: 0.4 } : undefined}
               >
                 <div className="label">{opt.label}</div>
                 <div className="mult">
-                  {r
-                    ? r.min === r.max
-                      ? `${r.min.toFixed(2)}x`
-                      : `${r.min.toFixed(2)}–${r.max.toFixed(2)}x`
-                    : '—'}
+                  {blocked
+                    ? 'kilitli'
+                    : r
+                      ? r.min === r.max
+                        ? `${r.min.toFixed(2)}x`
+                        : `${r.min.toFixed(2)}–${r.max.toFixed(2)}x`
+                      : '—'}
                 </div>
               </button>
             );
