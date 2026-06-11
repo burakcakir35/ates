@@ -1,0 +1,84 @@
+import { Controller, Get, NotFoundException, Param } from '@nestjs/common';
+import { verifyRound } from '@ates/engine';
+import { GAME_CONFIG } from '../config';
+import { GameService } from '../game/game.service';
+
+@Controller('api')
+export class ApiController {
+  constructor(private readonly game: GameService) {}
+
+  @Get('health')
+  health() {
+    return { ok: true, mode: 'play-money' };
+  }
+
+  @Get('config')
+  config() {
+    return {
+      bettingMs: GAME_CONFIG.bettingMs,
+      lockingMs: GAME_CONFIG.lockingMs,
+      resultMs: GAME_CONFIG.resultMs,
+      houseEdge: GAME_CONFIG.houseEdge,
+      minBet: GAME_CONFIG.minBet,
+      maxBet: GAME_CONFIG.maxBet,
+      currencies: GAME_CONFIG.currencies,
+    };
+  }
+
+  @Get('bet-types')
+  betTypes() {
+    return this.game.getBetCatalogue();
+  }
+
+  @Get('rounds/recent')
+  recent() {
+    return this.game.getHistory().map((r) => ({
+      roundId: r.roundId,
+      index: r.index,
+      winningChain: r.winningChain,
+      winningTxid: r.winningTxid,
+      totalStaked: r.totalStaked,
+      totalPaidOut: r.totalPaidOut,
+      awards: r.awards,
+      settledAt: r.settledAt,
+    }));
+  }
+
+  /** Provably-fair verification: recompute the result from revealed inputs. */
+  @Get('verify/:roundId')
+  verify(@Param('roundId') roundId: string) {
+    const round = this.game.findSettled(roundId);
+    if (!round) {
+      throw new NotFoundException('Round not found (only recent rounds kept)');
+    }
+    const valid = verifyRound({
+      roundId: round.roundId,
+      serverSeed: round.serverSeed,
+      commitHash: round.commitHash,
+      beacon: round.beacon,
+      resultHash: round.resultHash,
+      winningChain: round.winningChain,
+      winningTxid: round.winningTxid,
+    });
+    return {
+      roundId: round.roundId,
+      valid,
+      commitHash: round.commitHash,
+      serverSeed: round.serverSeed,
+      beacon: round.beacon,
+      resultHash: round.resultHash,
+      winningChain: round.winningChain,
+      winningTxid: round.winningTxid,
+    };
+  }
+
+  /**
+   * Operator stats. NOTE: in production this must sit behind the admin auth
+   * boundary (RBAC + 2FA + IP allowlist) described in the spec. It is open here
+   * only because this is a local play-money prototype.
+   */
+  @Get('admin/stats')
+  adminStats() {
+    return this.game.getStats();
+  }
+}
