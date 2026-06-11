@@ -14,6 +14,7 @@ import {
   commit,
   computeResultHash,
   contribute,
+  resolveJackpots,
   deriveWinningTxid,
   generateServerSeed,
   getChain,
@@ -54,6 +55,10 @@ export class GameService {
   private round!: Round;
   private roundCounter = 0;
   private jackpot: JackpotPools = initJackpot(DEFAULT_JACKPOT_CONFIG);
+  // Lifetime jackpot accounting (USD) — every payout is drawn from the pools
+  // above and never minted, so totalJackpotPaidUsd <= total contributions.
+  private jackpotPaidUsd = 0;
+  private jackpotCappedCount = 0;
   private history: SettledRound[] = [];
   private timer: NodeJS.Timeout | null = null;
   private started = false;
@@ -378,14 +383,16 @@ export class GameService {
     // Credit winnings and accumulate jackpot contributions.
     const byPlayer: Record<string, BetResult[]> = {};
     const wonByPlayer = new Set<string>();
-    const stakeByPlayer = new Map<string, number>();
+    // Pools and jackpot maths are denominated in USD; convert to player fiat
+    // only at payout time.
+    const stakeUsdByPlayer = new Map<string, number>();
 
     for (const bet of round.bets) {
       // Progressive pools are denominated in USD.
       contribute(this.jackpot, bet.amountUsd, DEFAULT_JACKPOT_CONFIG);
-      stakeByPlayer.set(
+      stakeUsdByPlayer.set(
         bet.playerId,
-        (stakeByPlayer.get(bet.playerId) ?? 0) + bet.amount,
+        (stakeUsdByPlayer.get(bet.playerId) ?? 0) + bet.amountUsd,
       );
     }
 
@@ -401,16 +408,20 @@ export class GameService {
       }
     }
 
+    const jackpotPaidBeforeUsd = this.jackpotPaidUsd;
     const awards = this.processJackpots(
       wonByPlayer,
-      stakeByPlayer,
+      stakeUsdByPlayer,
       winningChain,
       txid,
     );
+    const jackpotPaidUsdThisRound = this.jackpotPaidUsd - jackpotPaidBeforeUsd;
 
     // Round totals are normalized to USD (players may bet in any fiat).
     const totalStakedUsd = round.bets.reduce((s, b) => s + b.amountUsd, 0);
-    let totalPaidUsd = 0;
+    // Total paid out = regular settlement payouts + jackpot awards (the latter
+    // come from the pools, so they are a real house outflow this round).
+    let totalPaidUsd = jackpotPaidUsdThisRound;
     for (const result of settlement.results) {
       if (result.won) {
         const player = this.players.get(result.playerId);
@@ -454,86 +465,63 @@ export class GameService {
   }
 
   /**
-   * Resolve jackpot tiers from per-player streaks and the pure-chance tail
-   * gate, paying out and resetting progressive pools as needed.
+   * Resolve jackpot tiers via the pure engine resolver. Every tier — including
+   * MINI/MINOR — is paid strictly FROM the progressive pools (funded by the 4%
+   * contribution), capped at the pool balance. The house never mints jackpot
+   * money, so no player strategy (including single-side streak farming) can
+   * drive the house negative. Awards are converted to each player's fiat.
    */
   private processJackpots(
     wonByPlayer: Set<string>,
-    stakeByPlayer: Map<string, number>,
+    stakeUsdByPlayer: Map<string, number>,
     winningChain: ChainId,
     txid: string,
   ): JackpotAward[] {
     const cfg = DEFAULT_JACKPOT_CONFIG;
-    const awards: JackpotAward[] = [];
 
-    for (const [playerId, stake] of stakeByPlayer) {
+    const outcomes = [...stakeUsdByPlayer.entries()]
+      .filter(([id]) => this.players.has(id))
+      .map(([playerId, stakeUsd]) => ({
+        playerId,
+        stakeUsd,
+        won: wonByPlayer.has(playerId),
+      }));
+
+    const streaks = new Map<string, number>();
+    for (const o of outcomes) {
+      streaks.set(o.playerId, this.players.get(o.playerId)!.streak);
+    }
+
+    const hasTail = hasIdenticalTail(winningChain, txid, cfg.grandTailLength);
+    const res = resolveJackpots(this.jackpot, streaks, outcomes, hasTail, cfg);
+
+    // Sync streaks back to the players.
+    for (const [playerId, streak] of streaks) {
       const player = this.players.get(playerId);
+      if (player) {
+        player.streak = streak;
+      }
+    }
+
+    this.jackpotPaidUsd =
+      Math.round((this.jackpotPaidUsd + res.paidUsd) * 100) / 100;
+    this.jackpotCappedCount += res.cappedCount;
+
+    const awards: JackpotAward[] = [];
+    for (const a of res.awards) {
+      const player = this.players.get(a.playerId);
       if (!player) {
         continue;
       }
-      if (wonByPlayer.has(playerId)) {
-        player.streak += 1;
-      } else {
-        player.streak = 0;
-        continue;
-      }
-
-      if (player.streak === 3) {
-        awards.push(this.payAward(player, 'MINI', stake * cfg.miniMultiplier));
-      } else if (player.streak === 5) {
-        awards.push(this.payAward(player, 'MINOR', stake * cfg.minorMultiplier));
-      } else if (player.streak === cfg.grandStreak - 1) {
-        // Progressive pools are USD; award in the player's fiat.
-        awards.push(
-          this.payAward(
-            player,
-            'MAJOR',
-            convert(this.jackpot.major, 'USD', player.currency),
-          ),
-        );
-        this.jackpot.major = cfg.majorSeed;
-      } else if (player.streak >= cfg.grandStreak) {
-        awards.push(
-          this.payAward(
-            player,
-            'GRAND',
-            convert(this.jackpot.grand, 'USD', player.currency),
-          ),
-        );
-        this.jackpot.grand = cfg.grandSeed;
-        player.streak = 0;
-      }
+      const rounded =
+        Math.round(convert(a.amountUsd, 'USD', player.currency) * 100) / 100;
+      player.balance = Math.round((player.balance + rounded) * 100) / 100;
+      this.logger.log(
+        `Jackpot ${a.tier} of ${rounded} ${player.currency} -> ${player.id}`,
+      );
+      awards.push({ playerId: player.id, tier: a.tier, amount: rounded });
     }
-
-    // Pure-chance Grand gate: winning txid ends in N identical characters.
-    if (hasIdenticalTail(winningChain, txid, cfg.grandTailLength)) {
-      const winners = [...wonByPlayer];
-      if (winners.length > 0) {
-        const shareUsd = this.jackpot.grand / winners.length;
-        for (const playerId of winners) {
-          const player = this.players.get(playerId);
-          if (player) {
-            awards.push(
-              this.payAward(
-                player,
-                'GRAND_TAIL',
-                convert(shareUsd, 'USD', player.currency),
-              ),
-            );
-          }
-        }
-        this.jackpot.grand = cfg.grandSeed;
-      }
-    }
-
     return awards;
-  }
-
-  private payAward(player: Player, tier: string, amount: number): JackpotAward {
-    const rounded = Math.round(amount * 100) / 100;
-    player.balance = Math.round((player.balance + rounded) * 100) / 100;
-    this.logger.log(`Jackpot ${tier} of ${rounded} -> ${player.id}`);
-    return { playerId: player.id, tier, amount: rounded };
   }
 
   // ---- helpers ----------------------------------------------------------
@@ -636,6 +624,11 @@ export class GameService {
         major: Math.round(this.jackpot.major * 100) / 100,
         grand: Math.round(this.jackpot.grand * 100) / 100,
       },
+      // Lifetime jackpot accounting: every payout came from the pools above,
+      // never minted by the house. `capped` counts payouts clipped to a short
+      // pool (pool can never go negative).
+      jackpotPaidTotal: Math.round(this.jackpotPaidUsd * 100) / 100,
+      jackpotCappedPayouts: this.jackpotCappedCount,
     };
   }
 

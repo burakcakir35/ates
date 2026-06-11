@@ -11,6 +11,8 @@ interface Stats {
   recentTotalPaidOut: number;
   recentHousePnl: number;
   jackpot: { major: number; grand: number };
+  jackpotPaidTotal: number;
+  jackpotCappedPayouts: number;
 }
 
 interface RecentRound {
@@ -273,6 +275,15 @@ export default function AdminPage() {
               </div>
             </div>
           </div>
+          <p className="muted" style={{ marginTop: 12, fontSize: 13 }}>
+            Toplam jackpot ödemesi (havuzdan, USD):{' '}
+            <b>{(stats?.jackpotPaidTotal ?? 0).toFixed(2)}</b>
+            {' · '}havuz yetersizken kısılan ödeme:{' '}
+            <b>{stats?.jackpotCappedPayouts ?? 0}</b>
+            <br />
+            Tüm kademeler (MINI/MINOR dâhil) havuzdan fonlanır; ev jackpot
+            basmaz, havuz negatife düşmez.
+          </p>
         </div>
       </div>
 

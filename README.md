@@ -25,9 +25,10 @@ specification. Players bet on the character properties of a transaction-hash
 - **Bet types**: last char digit/letter, last char even/odd, first char
   high/low, digit-sum parity, sum-mod-N, exact last char.
 - **House edge / RTP**: payouts embed a configurable 6% edge (94% RTP).
-- **Jackpots**: Mini/Minor (fixed) + Major/Grand (progressive), funded by a 4%
-  bet contribution, plus the pure-chance "last 5 characters identical" Grand
-  gate and a win-streak Grand gate.
+- **Jackpots**: four tiers (Mini/Minor/Major/Grand) **all funded purely from a
+  4% bet contribution pool** — the house never mints jackpot money and payouts
+  are capped at the pool balance (it can never go negative). Plus the
+  pure-chance "last 5 characters identical" Grand gate and a win-streak gate.
 - **Risk controls**: min/max bet and a per-round max-exposure cap.
 - **Independent verification endpoint** and a verification UI page.
 
@@ -72,6 +73,10 @@ pnpm --filter @ates/web dev
 
 Then open http://localhost:3000 (player), http://localhost:3000/admin (operator
 view), http://localhost:3000/verify (provably-fair check).
+
+See **[RUN.md](./RUN.md)** for a step-by-step guide to running the player and
+admin sides side by side, the demo admin accounts (superadmin / finance /
+support / readonly), and a copy-paste panel-separation proof.
 
 For development with hot reload:
 

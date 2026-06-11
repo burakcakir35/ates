@@ -14,7 +14,7 @@ Production-only concerns (admin auth, persistence, real beacon) remain flagged.
 
 Toolchain gate (all green):
 ```
-pnpm test       -> engine 47 passed, server 24 passed (71 total)
+pnpm test       -> engine 54 passed, server 24 passed (78 total)
 pnpm typecheck  -> 3/3 packages OK
 pnpm lint       -> 3/3 packages, no warnings/errors
 pnpm build      -> OK (dist emitted)
@@ -22,10 +22,14 @@ pnpm build      -> OK (dist emitted)
 Live harness totals: engine adversarial 41/41 · WS integration 37/37 ·
 new-features live 28/28 · exposure cap 2/2.
 
-> **Update (Section 10):** two critical issues were addressed after the initial
-> report — the **risk-free counter-bet (arbitrage) exploit** and **admin/player
-> panel separation**. See [Section 10](#10-arbitraj-açığı-düzeltmesi--panel-ayrımı)
-> for the diagnosis (with numbers), the fix, and the new tests.
+> **Update (Section 10):** the **risk-free counter-bet (arbitrage) exploit** and
+> **admin/player panel separation** were addressed.
+> See [Section 10](#10-arbitraj-açığı-düzeltmesi--panel-ayrımı).
+>
+> **Update (Section 12):** the **jackpot streak leak** (MINI/MINOR were minted by
+> the house, so a single-side streak farmer was +EV) is now structurally closed —
+> all tiers are pool-funded and capped. See
+> [Section 12](#12-jackpot-streak-açığı-havuzdan-fonlama).
 
 ---
 
@@ -559,3 +563,89 @@ finance yazabilir). **PASS.**
   - **Rol kısıtı:** `readonly` / `readonly123` ile girersen istatistikleri
     **görürsün** ama bakiye değiştiren uç **403** döner (salt-okunur yazamaz).
   - **YANLIŞ:** Yanlış şifre kabul edilirse veya readonly yazabiliyorsa sorun var.
+
+---
+
+## 12. Jackpot streak açığı — havuzdan fonlama
+
+### A. TEŞHİS — kök neden (sayılarla)
+
+Karşıt-bahis kısıtı (Bölüm 10) **arbitrajı** kapattı ama yapısal bir kalem açık kaldı:
+`MINI (×10)` ve `MINOR (×20)` ödülleri **sabit çarpan** olarak **evin kasasından
+basılıyordu** (havuzla ilgisi yok). MAJOR/GRAND ise her ödemeden sonra `majorSeed=250` /
+`grandSeed=1000` tohumlarına **reset** ediliyordu — yani ev her büyük ödemeden sonra
+havuza **yeniden para basıyordu**. Sonuç: tek tarafa sabırla oynayıp streak avlayan oyuncu,
+oran matematiği doğru olsa bile uzun vadede **+EV** (ev aleyhine) olabiliyordu.
+
+**Tek-yön streak-avı simülasyonu (200.000 tur, 1 USD sabit bahis, p≈0.5):**
+
+| Ölçüm | ESKİ (kasadan basım) | YENİ (havuzdan fonlama) |
+|-------|----------------------|--------------------------|
+| Toplam yatırılan | 200.000,00 | 200.000,00 |
+| Normal ödeme (RTP) | 187.928,56 (0,9396) | 187.419,08 (0,9371) |
+| Jackpot ödemesi | **1.396.091,72** (üstüne basıldı) | 7.973,60 (≤ katkı 8.000) |
+| **Genel RTP** | **7,9201** | **0,9770** |
+| **Ev kâr/zarar** | **−1.384.020,28** (ev kaybeder) | **+4.607,32** (ev pozitif) |
+
+Eski modelde genel RTP **%792** ve ev **1,38M kaybediyor** — açık kanıtlandı.
+
+### B. DÜZELTME
+
+1. **Tohumlar sıfırlandı:** `grandSeed = 0`, `majorSeed = 0` — havuzlar **boş başlar**,
+   yalnızca her bahisten gelen **%4 katkı** ile büyür. Ev artık jackpot **basmaz/reset etmez**.
+2. **Tüm kademeler havuzdan fonlanır** (MINI/MINOR dâhil): MINI/MINOR/MAJOR Major havuzundan,
+   GRAND ve GRAND_TAIL Grand havuzundan ödenir.
+3. **Havuz koruması (cap):** Bir ödeme havuz bakiyesini aşacaksa **havuzla sınırlanır**;
+   havuz **negatife düşmez**. Bu durum loglanır ve admin istatistiğinde sayılır
+   (`jackpotCappedPayouts`).
+4. **Muhasebe netleşti:** Havuzlar USD cinsindendir; ödeme anında oyuncunun fiat'ına çevrilir.
+   `jackpotPaidTotal` (toplam jackpot ödemesi) ve `jackpotCappedPayouts` admin `stats`'a eklendi.
+   Tur P&L'i artık jackpot ödemelerini de gider olarak sayar.
+5. **Heyecan mekaniği korundu:** 4 kademe (MINI/MINOR/MAJOR/GRAND), streak eşikleri (3/5/6/7)
+   ve son-5-hane Grand kapısı **değişmedi** — yalnızca fonlama kaynağı değişti.
+
+Çekirdek mantık saf bir motor fonksiyonuna taşındı: `resolveJackpots(pools, streaks,
+outcomes, hasTail, config)` (engine `jackpot.ts`). Sunucu (`GameService.processJackpots`)
+bu fonksiyonu çağırır; böylece ekonomi deterministik ve test edilebilir.
+
+### C. TESTLER (step / expected / observed / PASS-FAIL)
+
+| # | Adım | Beklenen | Gözlenen | Sonuç |
+|---|------|----------|----------|-------|
+| 12.1 | `drawFromPool(100, 30)` | tam öde, kalan 70 | paid 30 / rem 70 / capped false | PASS |
+| 12.2 | `drawFromPool(10, 250)` | havuzla sınırla | paid 10 / rem 0 / capped true | PASS |
+| 12.3 | `drawFromPool(0, 50)` | boş havuz → 0 öde | paid 0 / rem 0 / capped true | PASS |
+| 12.4 | MINI, major havuzu boş | streak ilerler ama ödeme 0, havuz 0 | paid 0, capped 1, major 0 | PASS |
+| 12.5 | MINI, major=4 (istek 10) | havuzla sınırlı (4) | paid 4, major 0, capped 1 | PASS |
+| 12.6 | Kayıp turu | streak sıfırlanır, ödeme yok | streak 0, paid 0 | PASS |
+| 12.7 | 200k tek-yön streak-avı | havuz hiç negatif değil; jackpot ≤ katkı; ev pozitif; RTP<0,99 | major/grand ≥0 her tur; jackpot 7.973 ≤ 8.000; ev +4.607; RTP 0,977 | PASS |
+| 12.8 | Canlı admin `stats` | yeni alanlar görünür | `jackpotPaidTotal`,`jackpotCappedPayouts` döndü | PASS |
+
+**Regresyon:** karşıt-bahis kısıtı, oran matematiği (RTP analitik+Monte-Carlo), provably-fair,
+exposure cap, panel RBAC testleri **hâlâ PASS** (engine 54 + server 24 = 78 toplam).
+
+### D. Topluca canlı doğrulama (curl, sunucu :4000)
+
+```
+health                  -> 200
+admin/stats (tokensız)  -> 401
+admin/stats (sahte)     -> 401
+login superadmin        -> token (64 hane)
+admin/stats (token)     -> 200
+login (yanlış şifre)    -> 401
+readonly adjust         -> 403   (salt-okunur yazamaz)
+readonly stats          -> 200
+stats gövdesi           -> { ... "jackpotPaidTotal":0, "jackpotCappedPayouts":0 }  (havuzlar boş başlar)
+```
+
+### E. Sade Türkçe — bunu sen şöyle gör
+
+- **Tek tarafa uzun süre oyna (streak avı):** Bakiyen dalgalanır ama **uzun vadede erir**;
+  düzenli, risksiz artış **göremezsin**. (Eskiden MINI/MINOR sürekli basıldığı için artardı.)
+- **Jackpot havuzdan iniyor:** Admin panelinde **Jackpot Havuzları** kartında Major/Grand
+  havuzları ve **"Toplam jackpot ödemesi (havuzdan)"** + **"havuz yetersizken kısılan ödeme"**
+  sayısı görünür. Bir jackpot tetiklenince ödeme **havuzdan düşer**, evden ek basım olmaz.
+- **DOĞRU:** Havuz boşken jackpot tetiklenirse ödeme **0'a/kalan havuza** sınırlanır, havuz
+  **negatife düşmez**, "kısılan ödeme" sayacı artar.
+- **YANLIŞ:** Havuz negatif görünüyorsa veya streak-avı ile bakiye sürekli, risksiz artıyorsa
+  açık kapanmamış demektir.
